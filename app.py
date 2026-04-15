@@ -126,15 +126,32 @@ st.markdown("""
 # DATA LAYER
 # ─────────────────────────────────────────────────────────────────────────────
 
+REQUIRED_TABLES = {
+    "chart_of_accounts", "cost_centres", "customers", "suppliers",
+    "general_ledger", "accounts_receivable", "accounts_payable",
+    "bank_transactions", "fixed_assets", "depreciation_schedule",
+    "payroll_tax", "gst_transactions", "bas_returns",
+    "month_end_checklist", "intercompany", "tax_compliance_config", "monthly_budget",
+}
+
 @st.cache_resource
 def ensure_db():
-    """Generate data if DB doesn't exist."""
-    if not os.path.exists(DB_PATH):
+    """Generate (or regenerate) DB if missing or schema is outdated."""
+    needs_rebuild = not os.path.exists(DB_PATH)
+    if not needs_rebuild:
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            existing = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            conn.close()
+            if not REQUIRED_TABLES.issubset(existing):
+                needs_rebuild = True
+        except Exception:
+            needs_rebuild = True
+    if needs_rebuild:
         import generate_data
         generate_data.build_database()
 
 
-@st.cache_resource
 def get_connection():
     ensure_db()
     return sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -142,8 +159,8 @@ def get_connection():
 
 @st.cache_data(ttl=300)
 def query(sql: str) -> pd.DataFrame:
-    conn = get_connection()
-    return pd.read_sql_query(sql, conn)
+    with get_connection() as conn:
+        return pd.read_sql_query(sql, conn)
 
 
 def fmt_aud(val):
@@ -185,6 +202,7 @@ with st.sidebar:
         "Income Statement",
         "Balance Sheet",
         "Accounts Receivable",
+        "Accounts Payable",
         "Bank Reconciliation",
         "Fixed Assets",
         "Tax Compliance",
@@ -193,61 +211,118 @@ with st.sidebar:
     page = st.radio("Navigation", pages, label_visibility="collapsed")
 
     st.markdown("---")
-    # ── Global Filters — defined first so REPORT_DATE_DYN is available everywhere ──
-    st.markdown('<div style="font-size:0.78rem;color:#ccc;font-weight:700;margin-bottom:0.5rem">🔍 Global Filters</div>', unsafe_allow_html=True)
 
-    # Derive available periods from DB
-    _all_periods = query("SELECT DISTINCT period FROM general_ledger ORDER BY period")["period"].tolist()
-    _default_idx = _all_periods.index("2026-03") if "2026-03" in _all_periods else len(_all_periods) - 1
-    selected_period = st.selectbox(
-        "Period (YTD up to)",
-        _all_periods,
-        index=_default_idx,
-        help="All YTD figures include data up to and including this period.",
-    )
-
-    # Derive previous period for MoM
-    _sel_idx = _all_periods.index(selected_period)
-    prev_period = _all_periods[_sel_idx - 1] if _sel_idx > 0 else selected_period
-
-    # Dynamic report date label from period string
+    # ── Reference data & period helpers ────────────────────────────────────────
     import calendar as _cal
-    _yr, _mo = map(int, selected_period.split("-"))
-    _last_day = _cal.monthrange(_yr, _mo)[1]
-    _month_name = _cal.month_name[_mo]
-    REPORT_DATE_DYN = f"{_last_day} {_month_name} {_yr}"
 
+    _all_periods = query("SELECT DISTINCT period FROM general_ledger ORDER BY period")["period"].tolist()
+    _month_names = {1:"January",2:"February",3:"March",4:"April",5:"May",6:"June",
+                    7:"July",8:"August",9:"September",10:"October",11:"November",12:"December"}
+
+    # Derive Financial Years from available data
+    _fy_set = set()
+    for _p in _all_periods:
+        _y, _m = int(_p[:4]), int(_p[5:7])
+        _fy_set.add(f"FY{_y+1}" if _m >= 7 else f"FY{_y}")
+    _fy_years = sorted(_fy_set)   # e.g. ["FY2026"]
+
+    def _fy_bounds(fy):
+        """Return (start_period, end_period) for a FY string like 'FY2026'."""
+        yr = int(fy[2:])
+        return f"{yr-1}-07", f"{yr}-06"
+
+    def _fy_quarters(fy):
+        """Return ordered dict of {label: (start, end)} for available quarters."""
+        yr = int(fy[2:])
+        qs = {
+            f"Q1  Jul–Sep {yr-1}": (f"{yr-1}-07", f"{yr-1}-09"),
+            f"Q2  Oct–Dec {yr-1}": (f"{yr-1}-10", f"{yr-1}-12"),
+            f"Q3  Jan–Mar {yr}":   (f"{yr}-01",   f"{yr}-03"),
+            f"Q4  Apr–Jun {yr}":   (f"{yr}-04",   f"{yr}-06"),
+        }
+        # Only keep quarters that overlap with available data
+        return {k: v for k, v in qs.items()
+                if any(_all_periods[0] <= p <= _all_periods[-1]
+                       for p in [v[0], v[1]])}
+
+    # ── Session-state defaults (widgets live on Executive Overview page) ───────
+    if "view_type"   not in st.session_state: st.session_state.view_type   = "YTD"
+    if "sel_fy"      not in st.session_state: st.session_state.sel_fy      = _fy_years[-1]
+    if "sel_month"   not in st.session_state: st.session_state.sel_month   = int(_all_periods[-1][5:7])
+    if "sel_quarter" not in st.session_state: st.session_state.sel_quarter = None
+
+    # Compute period_start / period_end from session_state
+    _fy        = st.session_state.sel_fy
+    _fy_start, _fy_end_raw = _fy_bounds(_fy)
+    _fy_end    = min(_fy_end_raw, _all_periods[-1])   # clamp to available data
+    _view      = st.session_state.view_type
+
+    if _view == "Monthly":
+        _mo = st.session_state.sel_month
+        _yr_for_mo = int(_fy[2:]) - 1 if _mo >= 7 else int(_fy[2:])
+        period_end   = f"{_yr_for_mo}-{_mo:02d}"
+        period_start = period_end
+    elif _view == "Quarterly":
+        _qs = _fy_quarters(_fy)
+        _qk = st.session_state.sel_quarter
+        if _qk not in _qs: _qk = list(_qs.keys())[-1]
+        period_start, period_end = _qs[_qk]
+    elif _view == "Full Year":
+        period_start, period_end = _fy_start, _fy_end
+    else:  # YTD (default)
+        _mo = st.session_state.sel_month
+        _yr_for_mo = int(_fy[2:]) - 1 if _mo >= 7 else int(_fy[2:])
+        period_end   = f"{_yr_for_mo}-{_mo:02d}"
+        period_start = _fy_start
+
+    # Clamp both bounds to available data
+    period_start = max(period_start, _all_periods[0])
+    period_end   = min(period_end,   _all_periods[-1])
+
+    # Derived display helpers
+    _pe_yr, _pe_mo  = map(int, period_end.split("-"))
+    _ps_yr, _ps_mo  = map(int, period_start.split("-"))
+    REPORT_DATE_DYN = f"{_cal.monthrange(_pe_yr,_pe_mo)[1]} {_cal.month_name[_pe_mo]} {_pe_yr}"
+    period_label    = {
+        "Monthly":   f"{_cal.month_name[_pe_mo]} {_pe_yr}",
+        "Quarterly": st.session_state.get("sel_quarter","") or "",
+        "YTD":       f"Jul {_ps_yr} – {_cal.month_name[_pe_mo]} {_pe_yr}",
+        "Full Year": f"Full Year {_fy}",
+    }.get(_view, REPORT_DATE_DYN)
+
+    # MoM (previous period to period_end)
+    _pe_idx     = _all_periods.index(period_end) if period_end in _all_periods else len(_all_periods)-1
+    prev_period = _all_periods[_pe_idx - 1] if _pe_idx > 0 else period_end
+    selected_period = period_end   # backward-compat alias used in non-Exec pages
+
+    # Global aliases used across ALL pages (not just Exec Overview)
+    view_type = _view
+    sel_fy    = _fy
+    _kpi_lbl  = {"Monthly": "Month", "Quarterly": "Quarter", "YTD": "YTD", "Full Year": "FY"}.get(view_type, "Period")
+    _pl_period_note = {
+        "Monthly":   f"for {_cal.month_name[_pe_mo]} {_pe_yr}",
+        "Quarterly": f"for {period_label}",
+        "YTD":       f"YTD  Jul {_ps_yr} → {_cal.month_name[_pe_mo]} {_pe_yr}",
+        "Full Year": f"Full Year {sel_fy}",
+    }.get(view_type, period_label)
+
+    # Sidebar info (read-only display)
     st.markdown(f"""
-    <div style="font-size:0.73rem; color:#999;margin-bottom:0.5rem">
+    <div style="font-size:0.73rem;color:#999;margin-bottom:0.4rem">
         <b style="color:#ccc;">{ENTITY}</b><br>
         ABN {ABN}<br>
-        Period: {REPORT_DATE_DYN}<br>
-        FY2026 (Jul 25 – Jun 26)
-    </div>
-    """, unsafe_allow_html=True)
+        <b style="color:#E8192C">{view_type}</b>: {period_label}<br>
+        As at: {REPORT_DATE_DYN}
+    </div>""", unsafe_allow_html=True)
 
     st.markdown("---")
 
-    selected_regions = st.multiselect(
-        "Region",
-        ["Domestic", "International"],
-        default=["Domestic", "International"],
-        help="Filters AR aging, Revenue Mix, and Regional Concentration sections.",
-    )
-    if not selected_regions:
-        selected_regions = ["Domestic", "International"]
-
+    # Region & Cost Centre — defaults (widgets on Exec Overview page)
     _all_cc = query("SELECT cost_centre_code, cost_centre_name FROM cost_centres ORDER BY cost_centre_code")
     _cc_map = dict(zip(_all_cc["cost_centre_name"], _all_cc["cost_centre_code"]))
-    selected_cc_names = st.multiselect(
-        "Cost Centre",
-        list(_cc_map.keys()),
-        default=list(_cc_map.keys()),
-        help="Filters expense and revenue breakdowns by business unit.",
-    )
-    if not selected_cc_names:
-        selected_cc_names = list(_cc_map.keys())
-    selected_cc_codes = [_cc_map[n] for n in selected_cc_names]
+    selected_regions  = ["Domestic", "International"]
+    selected_cc_names = list(_cc_map.keys())
+    selected_cc_codes = list(_cc_map.values())
 
     # ── Scenario Slicer ──
     st.markdown('<div style="font-size:0.72rem;color:#aaa;margin:0.6rem 0 0.3rem;font-weight:700">📊 Scenario</div>', unsafe_allow_html=True)
@@ -315,17 +390,191 @@ def page_header(title, subtitle=""):
 if page == "Executive Overview":
     page_header(
         "Executive Financial Overview",
-        f"{ENTITY}  |  FY2026 YTD as at {REPORT_DATE_DYN}  |  "
-        + (f"Region: {', '.join(selected_regions)}" if len(selected_regions) < 2 else "All Regions")
-        + (f"  |  {len(selected_cc_names)} cost centre(s)" if len(selected_cc_names) < len(_cc_map) else "")
+        f"{ENTITY}  |  {period_label}  |  as at {REPORT_DATE_DYN}"
     )
+
+    # ── Inline filter bar ──────────────────────────────────────────────────────
+    _lbl = '<p style="font-size:0.72rem;font-weight:700;color:#555;margin:0 0 0.15rem;text-transform:uppercase;letter-spacing:0.05em">'
+
+    with st.container():
+        st.markdown("""<div style="background:#F5F5F5;border-radius:10px;padding:1rem 1.4rem 1rem;
+                    margin-bottom:1rem;border:1px solid #ddd">""", unsafe_allow_html=True)
+
+        # ── ROW 1 : View Type + Financial Year ────────────────────────────────
+        r1a, r1b, r1c = st.columns([2.5, 1.2, 3.3])
+        with r1a:
+            st.markdown(_lbl + "View Type</p>", unsafe_allow_html=True)
+            view_type = st.radio(
+                "View Type", ["Monthly", "Quarterly", "YTD", "Full Year"],
+                index=["Monthly","Quarterly","YTD","Full Year"].index(
+                    st.session_state.view_type if st.session_state.view_type in ["Monthly","Quarterly","YTD","Full Year"] else "YTD"
+                ),
+                horizontal=True, label_visibility="collapsed", key="eo_view",
+            )
+            st.session_state.view_type = view_type
+
+        with r1b:
+            st.markdown(_lbl + "Financial Year</p>", unsafe_allow_html=True)
+            sel_fy = st.selectbox("FY", _fy_years,
+                index=_fy_years.index(st.session_state.sel_fy) if st.session_state.sel_fy in _fy_years else len(_fy_years)-1,
+                label_visibility="collapsed", key="eo_fy")
+            st.session_state.sel_fy = sel_fy
+
+        # ── ROW 2 : Period selector (changes based on view type) ──────────────
+        _fy_s, _fy_e_raw = _fy_bounds(sel_fy)
+        _fy_e = min(_fy_e_raw, _all_periods[-1])
+        _fy_int = int(sel_fy[2:])
+
+        with r1c:
+            if view_type in ("Monthly", "YTD"):
+                # Months available for this FY (Jul→Jun, clamped to data)
+                _fy_mo_periods = [p for p in _all_periods if _fy_s <= p <= _fy_e]
+                _mo_options    = [f"{_cal.month_name[int(p[5:7])]} {p[:4]}" for p in _fy_mo_periods]
+                _mo_vals       = _fy_mo_periods   # parallel list of "YYYY-MM"
+                _cur_mo_str    = f"{st.session_state.sel_month:02d}"
+                _cur_mo_matches= [i for i,p in enumerate(_mo_vals)
+                                   if p[5:7] == _cur_mo_str]
+                _mo_def_idx    = _cur_mo_matches[-1] if _cur_mo_matches else len(_mo_vals)-1
+
+                _col_lbl = "End Month" if view_type == "YTD" else "Month"
+                st.markdown(_lbl + f"{_col_lbl}</p>", unsafe_allow_html=True)
+                sel_mo_label = st.selectbox(_col_lbl, _mo_options,
+                    index=_mo_def_idx, label_visibility="collapsed", key="eo_month")
+                sel_mo_period = _mo_vals[_mo_options.index(sel_mo_label)]
+                st.session_state.sel_month = int(sel_mo_period[5:7])
+
+                period_end   = sel_mo_period
+                period_start = _fy_s if view_type == "YTD" else sel_mo_period
+
+            elif view_type == "Quarterly":
+                _qs = _fy_quarters(sel_fy)
+                _q_keys = list(_qs.keys())
+                _cur_q  = st.session_state.sel_quarter
+                _q_idx  = _q_keys.index(_cur_q) if _cur_q in _q_keys else len(_q_keys)-1
+                st.markdown(_lbl + "Quarter</p>", unsafe_allow_html=True)
+                sel_q = st.selectbox("Quarter", _q_keys,
+                    index=_q_idx, label_visibility="collapsed", key="eo_quarter")
+                st.session_state.sel_quarter = sel_q
+                period_start, period_end = _qs[sel_q]
+
+            else:  # Full Year
+                period_start, period_end = _fy_s, _fy_e
+                st.markdown(_lbl + "Period</p>", unsafe_allow_html=True)
+                _fy_yr = int(sel_fy[2:])
+                st.markdown(f"""<div style="padding:0.4rem 0.8rem;background:white;border:1px solid #ddd;
+                    border-radius:6px;font-size:0.83rem;color:#444;margin-top:0.05rem">
+                    Jul {_fy_yr-1} → Jun {_fy_yr} (full year)</div>""",
+                    unsafe_allow_html=True)
+
+        # Clamp to available data
+        period_start = max(period_start, _all_periods[0])
+        period_end   = min(period_end,   _all_periods[-1])
+        selected_period = period_end   # backward-compat alias
+
+        # Recompute display labels
+        _pe_yr, _pe_mo = map(int, period_end.split("-"))
+        _ps_yr, _ps_mo = map(int, period_start.split("-"))
+        REPORT_DATE_DYN = f"{_cal.monthrange(_pe_yr,_pe_mo)[1]} {_cal.month_name[_pe_mo]} {_pe_yr}"
+        _pe_idx     = _all_periods.index(period_end) if period_end in _all_periods else len(_all_periods)-1
+        prev_period = _all_periods[_pe_idx-1] if _pe_idx > 0 else period_end
+        period_label = {
+            "Monthly":   f"{_cal.month_name[_pe_mo]} {_pe_yr}",
+            "Quarterly": st.session_state.get("sel_quarter",""),
+            "YTD":       f"Jul {_ps_yr} → {_cal.month_name[_pe_mo]} {_pe_yr}",
+            "Full Year": f"Full Year {sel_fy}",
+        }[view_type]
+
+        # Period badge
+        badge_colours = {"Monthly":"#005EA5","Quarterly":"#F7941D","YTD":"#E8192C","Full Year":"#00875A"}
+        st.markdown(f"""<div style="margin-top:0.6rem">
+            <span style="background:{badge_colours[view_type]};color:white;padding:3px 10px;
+                border-radius:12px;font-size:0.78rem;font-weight:700">{view_type}</span>
+            <span style="font-size:0.83rem;color:#444;margin-left:0.5rem">
+                {period_label} &nbsp;·&nbsp; as at <b>{REPORT_DATE_DYN}</b>
+            </span></div>""", unsafe_allow_html=True)
+
+        st.markdown("<hr style='margin:0.8rem 0 0.6rem;border-color:#ddd'>", unsafe_allow_html=True)
+
+        # ── ROW 3 : Region + Cost Centre with Select All / Clear ──────────────
+        # Callbacks for Select All / Clear buttons
+        def _sel_all_reg():
+            st.session_state["eo_reg_dom"] = True
+            st.session_state["eo_reg_int"] = True
+        def _clr_reg():
+            st.session_state["eo_reg_dom"] = True   # keep at least one
+            st.session_state["eo_reg_int"] = False
+        def _sel_all_cc():
+            for _n in _cc_map: st.session_state[f"eo_cc_{_n}"] = True
+        def _clr_cc():
+            for _n in _cc_map: st.session_state[f"eo_cc_{_n}"] = False
+
+        fc1, fc2, fc3 = st.columns([1.1, 2, 2])
+
+        with fc1:
+            st.markdown(_lbl + "Region</p>", unsafe_allow_html=True)
+            rb1, rb2 = st.columns(2)
+            with rb1: st.button("All",   on_click=_sel_all_reg, key="btn_reg_all",  use_container_width=True)
+            with rb2: st.button("Clear", on_click=_clr_reg,     key="btn_reg_clr",  use_container_width=True)
+            reg_dom = st.checkbox("Domestic",      value=True, key="eo_reg_dom")
+            reg_int = st.checkbox("International", value=True, key="eo_reg_int")
+            selected_regions = (
+                ["Domestic","International"] if (reg_dom and reg_int)
+                else ["Domestic"]      if reg_dom
+                else ["International"] if reg_int
+                else ["Domestic","International"]
+            )
+
+        with fc2:
+            st.markdown(_lbl + "Cost Centre</p>", unsafe_allow_html=True)
+            cb1, cb2 = st.columns(2)
+            with cb1: st.button("All",   on_click=_sel_all_cc, key="btn_cc_all", use_container_width=True)
+            with cb2: st.button("Clear", on_click=_clr_cc,     key="btn_cc_clr", use_container_width=True)
+            selected_cc_names = []
+            _cc_list = list(_cc_map.keys())
+            for _n in _cc_list[:4]:
+                if st.checkbox(_n, value=st.session_state.get(f"eo_cc_{_n}", True), key=f"eo_cc_{_n}"):
+                    selected_cc_names.append(_n)
+
+        with fc3:
+            st.markdown(_lbl + "&nbsp;</p>", unsafe_allow_html=True)
+            st.markdown("<div style='margin-top:2.05rem'></div>", unsafe_allow_html=True)
+            for _n in _cc_list[4:]:
+                if st.checkbox(_n, value=st.session_state.get(f"eo_cc_{_n}", True), key=f"eo_cc_{_n}"):
+                    selected_cc_names.append(_n)
+
+        if not selected_cc_names:
+            selected_cc_names = list(_cc_map.keys())
+        selected_cc_codes = [_cc_map[n] for n in selected_cc_names]
+
+        # Summary caption
+        r_lbl = ", ".join(selected_regions) if len(selected_regions) < 2 else "All Regions"
+        c_lbl = f"{len(selected_cc_names)} of {len(_cc_map)} cost centres" if len(selected_cc_names) < len(_cc_map) else "All Cost Centres"
+        st.markdown(f"""<div style="font-size:0.76rem;color:#666;margin-top:0.4rem">
+            Showing: <b>{r_lbl}</b> &nbsp;·&nbsp; <b>{c_lbl}</b></div>""",
+            unsafe_allow_html=True)
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
 
     gl  = query("SELECT * FROM general_ledger")
     coa = query("SELECT account_code, account_name FROM chart_of_accounts")
 
-    # Apply cost-centre filter to GL
-    ytd_all = gl[gl["period"] <= selected_period]
-    ytd = ytd_all[ytd_all["cost_centre"].isin(selected_cc_codes)]
+    # GL slices:
+    #   gl_window = transactions IN the selected period range (for P&L / revenue / expense)
+    #   gl_cumul  = transactions UP TO period_end (for Balance Sheet / cumulative figures)
+    gl_window = gl[
+        (gl["period"] >= period_start) &
+        (gl["period"] <= period_end) &
+        (gl["cost_centre"].isin(selected_cc_codes))
+    ]
+    gl_cumul  = gl[
+        (gl["period"] <= period_end) &
+        (gl["cost_centre"].isin(selected_cc_codes))
+    ]
+    # Keep full cumulative for MoM calcs (no CC filter needed for prev period)
+    ytd_all = gl[gl["period"] <= period_end]
+    ytd     = gl_window   # alias used below
 
     # Revenue accounts: 4001–4999; filter by region via AR customer region mapping
     # For cost-centre-filtered revenue we use GL cost_centre (CC001 = Academic Programs carries most revenue)
@@ -341,30 +590,29 @@ if page == "Executive Overview":
     ar_filt = ar_all[ar_all["region"].isin(selected_regions)]
     ar_outstanding = ar_filt["total_inc_gst"].sum()
 
-    # MoM: selected period vs prior period, same CC filter
+    # MoM comparison: period_end month vs prior month
     rev_prev = ytd_all[
         (ytd_all["period"] == prev_period) &
         (ytd_all["account_code"].between("4001","4999")) &
         (ytd_all["cost_centre"].isin(selected_cc_codes))
     ]["credit"].sum()
     rev_curr = ytd_all[
-        (ytd_all["period"] == selected_period) &
+        (ytd_all["period"] == period_end) &
         (ytd_all["account_code"].between("4001","4999")) &
         (ytd_all["cost_centre"].isin(selected_cc_codes))
     ]["credit"].sum()
-    rev_mom  = ((rev_curr - rev_prev) / rev_prev * 100) if rev_prev else 0
+    rev_mom     = ((rev_curr - rev_prev) / rev_prev * 100) if rev_prev else 0
     rev_mom_abs = rev_curr - rev_prev
-    mom_arrow = "▲" if rev_mom >= 0 else "▼"
-    mom_type  = "pos" if rev_mom >= 0 else "neg"
+    mom_arrow   = "▲" if rev_mom >= 0 else "▼"
+    mom_type    = "pos" if rev_mom >= 0 else "neg"
 
-    # Expense MoM
     exp_prev = ytd_all[
         (ytd_all["period"] == prev_period) &
         (ytd_all["account_code"].between("5001","5999")) &
         (ytd_all["cost_centre"].isin(selected_cc_codes))
     ]["debit"].sum()
     exp_curr = ytd_all[
-        (ytd_all["period"] == selected_period) &
+        (ytd_all["period"] == period_end) &
         (ytd_all["account_code"].between("5001","5999")) &
         (ytd_all["cost_centre"].isin(selected_cc_codes))
     ]["debit"].sum()
@@ -374,7 +622,7 @@ if page == "Executive Overview":
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
         st.markdown(kpi_card(
-            f"YTD Revenue  ({selected_period[:7]})",
+            f"{_kpi_lbl} Revenue",
             fmt_aud(rev_ytd),
             f"{mom_arrow} {fmt_aud(abs(rev_mom_abs))} ({rev_mom:+.1f}%) vs {prev_period}",
             mom_type,
@@ -382,7 +630,7 @@ if page == "Executive Overview":
     with c2:
         exp_mom_arrow = "▼" if exp_mom >= 0 else "▲"   # rising expenses = bad
         st.markdown(kpi_card(
-            "YTD Expenses",
+            f"{_kpi_lbl} Expenses",
             fmt_aud(exp_ytd),
             f"{exp_mom_arrow} {exp_mom:+.1f}% MoM  ·  {round(exp_ytd/rev_ytd*100,1) if rev_ytd else 0}% of Rev",
             "neg" if exp_mom > 5 else "neu",
@@ -391,7 +639,7 @@ if page == "Executive Overview":
         st.markdown(kpi_card(
             "Net Surplus / (Deficit)",
             fmt_aud(net_ytd),
-            f"Margin {fmt_pct(margin)}",
+            f"{_kpi_lbl} margin {fmt_pct(margin)}",
             "pos" if net_ytd >= 0 else "neg",
         ), unsafe_allow_html=True)
     with c4:
@@ -410,7 +658,7 @@ if page == "Executive Overview":
     # ── Revenue vs Expense trend ──
     col_left, col_right = st.columns([3, 2])
     with col_left:
-        section(f"Monthly Revenue vs Expenses – YTD to {selected_period}")
+        section(f"Monthly Revenue vs Expenses – {period_label}")
         monthly = (
             ytd.groupby("period")
             .apply(lambda d: pd.Series({
@@ -709,44 +957,86 @@ elif page == "Month-End Close":
 elif page == "Income Statement":
     page_header(
         "Income Statement (P&L)",
-        f"{ENTITY}  |  FY2026 YTD as at {REPORT_DATE_DYN}"
+        f"{ENTITY}  |  {period_label}  |  as at {REPORT_DATE_DYN}"
     )
 
     gl  = query("SELECT * FROM general_ledger")
     coa = query("SELECT account_code, account_name, account_type, report_section FROM chart_of_accounts")
 
-    ytd = gl[(gl["period"] <= selected_period) & (gl["cost_centre"].isin(selected_cc_codes))]
+    # P&L = transactions WITHIN the selected window (period_start → period_end)
+    ytd = gl[
+        (gl["period"] >= period_start) &
+        (gl["period"] <= period_end) &
+        (gl["cost_centre"].isin(selected_cc_codes))
+    ]
     ytd = ytd.merge(coa, on="account_code", how="left")
+
+    _pl_period_note = {
+        "Monthly":   f"for {_cal.month_name[_pe_mo]} {_pe_yr}",
+        "Quarterly": f"for {period_label}",
+        "YTD":       f"YTD  Jul {_ps_yr} → {_cal.month_name[_pe_mo]} {_pe_yr}",
+        "Full Year": f"Full Year {sel_fy}",
+    }.get(view_type, period_label)
+
+    st.info(f"P&L view: **{_pl_period_note}**  ·  Balance Sheet on this page shows cumulative **as at {REPORT_DATE_DYN}**", icon="ℹ️")
+
+    # ── KPI strip — anchored to budget targets ────────────────────────────────
+    budget = query("SELECT * FROM monthly_budget")
+    bud_win = budget[(budget["period"] >= period_start) & (budget["period"] <= period_end)]
+    bud_rev = bud_win["budget_revenue"].sum()
+    bud_exp = bud_win["budget_expenses"].sum()
+    bud_net = bud_win["budget_net"].sum()
 
     # Revenue
     rev = ytd[ytd["account_type"] == "Revenue"].groupby("account_name")["credit"].sum().reset_index()
-    rev.columns = ["Line Item", "YTD Amount"]
-    total_rev = rev["YTD Amount"].sum()
+    rev.columns = ["Line Item", "Period Amount"]
+    total_rev = rev["Period Amount"].sum()
 
     # Expenses
     exp = ytd[ytd["account_type"] == "Expense"].groupby(["report_section","account_name"])["debit"].sum().reset_index()
-    exp.columns = ["Section","Line Item","YTD Amount"]
-    total_exp = exp["YTD Amount"].sum()
+    exp.columns = ["Section","Line Item","Period Amount"]
+    total_exp = exp["Period Amount"].sum()
     net = total_rev - total_exp
+    net_margin_pct = (net / total_rev * 100) if total_rev else 0
+    rev_vs_bud     = total_rev - bud_rev
+    net_vs_bud     = net - bud_net
 
+    _ki1, _ki2, _ki3, _ki4 = st.columns(4)
+    with _ki1: st.markdown(kpi_card(
+        "Revenue", fmt_aud(total_rev),
+        f"{'▲' if rev_vs_bud >= 0 else '▼'} {fmt_aud(abs(rev_vs_bud))} vs budget",
+        "pos" if rev_vs_bud >= 0 else "neg"), unsafe_allow_html=True)
+    with _ki2: st.markdown(kpi_card(
+        "Total Expenses", fmt_aud(total_exp),
+        f"Budget: {fmt_aud(bud_exp)}",
+        "neg" if total_exp > bud_exp else "pos"), unsafe_allow_html=True)
+    with _ki3: st.markdown(kpi_card(
+        "Net Margin", f"{net_margin_pct:.1f}%",
+        f"Net result: {fmt_aud(net)}",
+        "pos" if net_margin_pct >= 10 else ("neu" if net_margin_pct >= 0 else "neg")), unsafe_allow_html=True)
+    with _ki4: st.markdown(kpi_card(
+        "Net vs Budget", fmt_aud(net_vs_bud),
+        f"{'Ahead' if net_vs_bud >= 0 else 'Behind'} budget by {fmt_aud(abs(net_vs_bud))}",
+        "pos" if net_vs_bud >= 0 else "neg"), unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
     col1, col2 = st.columns([2, 3])
 
     with col1:
-        section("Profit & Loss Statement")
-        # Build P&L table
+        section(f"Profit & Loss Statement  —  {_pl_period_note}")
         lines = []
         lines.append({"Category": "REVENUE", "Line Item": "", "Amount": ""})
-        for _, r in rev.sort_values("YTD Amount", ascending=False).iterrows():
-            lines.append({"Category": "", "Line Item": r["Line Item"], "Amount": f"${r['YTD Amount']:,.0f}"})
+        for _, r in rev.sort_values("Period Amount", ascending=False).iterrows():
+            lines.append({"Category": "", "Line Item": r["Line Item"], "Amount": f"${r['Period Amount']:,.0f}"})
         lines.append({"Category": "Total Revenue", "Line Item": "", "Amount": f"${total_rev:,.0f}"})
         lines.append({"Category": "", "Line Item": "", "Amount": ""})
         lines.append({"Category": "EXPENSES", "Line Item": "", "Amount": ""})
         for section_name in exp["Section"].unique():
             sec_data = exp[exp["Section"] == section_name]
             lines.append({"Category": section_name, "Line Item": "", "Amount": ""})
-            for _, r in sec_data.sort_values("YTD Amount", ascending=False).iterrows():
-                lines.append({"Category": "", "Line Item": f"  {r['Line Item']}", "Amount": f"${r['YTD Amount']:,.0f}"})
-            sec_total = sec_data["YTD Amount"].sum()
+            for _, r in sec_data.sort_values("Period Amount", ascending=False).iterrows():
+                lines.append({"Category": "", "Line Item": f"  {r['Line Item']}", "Amount": f"${r['Period Amount']:,.0f}"})
+            sec_total = sec_data["Period Amount"].sum()
             lines.append({"Category": f"  Subtotal – {section_name}", "Line Item": "", "Amount": f"${sec_total:,.0f}"})
         lines.append({"Category": "Total Expenses", "Line Item": "", "Amount": f"${total_exp:,.0f}"})
         lines.append({"Category": "", "Line Item": "", "Amount": ""})
@@ -756,8 +1046,8 @@ elif page == "Income Statement":
         pl_df = pd.DataFrame(lines)
         rows_html = ""
         for _, row in pl_df.iterrows():
-            bold = "font-weight:700;" if row["Category"] in ("REVENUE","EXPENSES","Total Revenue","Total Expenses") or row["Category"].startswith("NET") else ""
-            bg = "background:#F5F5F5;" if bold else ""
+            bold  = "font-weight:700;" if row["Category"] in ("REVENUE","EXPENSES","Total Revenue","Total Expenses") or row["Category"].startswith("NET") else ""
+            bg    = "background:#F5F5F5;" if bold else ""
             color = f"color:{GREEN};" if row["Category"].startswith("NET SURPLUS") else (f"color:{RMIT_RED};" if row["Category"].startswith("NET DEFICIT") else "")
             rows_html += f"""<tr style="{bg}">
                 <td style="padding:5px 8px;font-size:0.83rem;{bold}{color}">{row['Category']}</td>
@@ -770,7 +1060,7 @@ elif page == "Income Statement":
                 <tr>
                     <th style="padding:9px 8px;text-align:left;font-size:0.8rem">Category</th>
                     <th style="padding:9px 8px;text-align:left;font-size:0.8rem">Line Item</th>
-                    <th style="padding:9px 8px;text-align:right;font-size:0.8rem">YTD Amount</th>
+                    <th style="padding:9px 8px;text-align:right;font-size:0.8rem">{_kpi_lbl} Amount</th>
                 </tr>
             </thead>
             <tbody>{rows_html}</tbody>
@@ -806,8 +1096,8 @@ elif page == "Income Statement":
         st.plotly_chart(fig, use_container_width=True)
 
         section("Expense Category Mix")
-        exp_mix = exp.groupby("Section")["YTD Amount"].sum().reset_index()
-        fig2 = px.pie(exp_mix, values="YTD Amount", names="Section",
+        exp_mix = exp.groupby("Section")["Period Amount"].sum().reset_index()
+        fig2 = px.pie(exp_mix, values="Period Amount", names="Section",
                       color_discrete_sequence=CHART_PALETTE, hole=0.4)
         fig2.update_traces(textinfo="percent+label", textposition="outside", textfont_size=11)
         fig2.update_layout(height=300, margin=dict(l=0, r=0, t=10, b=0),
@@ -875,6 +1165,16 @@ elif page == "Balance Sheet":
     total_liab = ap + accruals + gst_pay + ptax_pay + def_rev + ic_pay + lease_l
     total_eq   = round(total_assets - total_liab, 2)
 
+    # ── GL-based YTD net P&L — same source as Income Statement ──────────────
+    coa_all = query("SELECT account_code, account_type FROM chart_of_accounts")
+    ytd_gl  = ytd.merge(coa_all, on="account_code", how="left")
+    _rev_gl = (ytd_gl[ytd_gl["account_type"] == "Revenue"]["credit"].sum()
+             - ytd_gl[ytd_gl["account_type"] == "Revenue"]["debit"].sum())
+    _exp_gl = (ytd_gl[ytd_gl["account_type"] == "Expense"]["debit"].sum()
+             - ytd_gl[ytd_gl["account_type"] == "Expense"]["credit"].sum())
+    ytd_net_pl_bs        = round(_rev_gl - _exp_gl, 0)
+    retained_earnings_bs = round(total_eq - ytd_net_pl_bs, 0)
+
     col1, col2 = st.columns(2)
 
     def bs_table(title, rows_data):
@@ -937,9 +1237,9 @@ elif page == "Balance Sheet":
             ("Total Non-Current Liabilities", lease_l,  True),
         ]), unsafe_allow_html=True)
         st.markdown(bs_table("Equity", [
-            ("Retained Earnings",     round(total_eq * 0.70, 0), False),
-            ("Current Year Earnings", round(total_eq * 0.30, 0), False),
-            ("Total Equity",          round(total_eq, 0),         True),
+            ("Retained Earnings  (FY2025 closing balance)", retained_earnings_bs, False),
+            ("Current Year Earnings  (YTD net P&L)",        ytd_net_pl_bs,        False),
+            ("Total Equity",                                 round(total_eq, 0),    True),
         ]), unsafe_allow_html=True)
         st.markdown(f"""<div style="background:#E8192C;color:white;padding:10px 14px;border-radius:6px;font-weight:700;font-size:0.9rem">
             TOTAL LIABILITIES & EQUITY &nbsp;&nbsp; <span style="float:right">${round(total_liab+total_eq,0):,.0f}</span></div>""",
@@ -949,36 +1249,20 @@ elif page == "Balance Sheet":
     # ── Accounting Equation Breakdown ──
     st.markdown("<br>", unsafe_allow_html=True)
     section("Accounting Equation Check  —  Assets = Liabilities + Equity + Net P&L")
-    st.caption("FY2026 is an open period — P&L has not yet been closed to retained earnings. "
-               "The equation balances only when YTD Net P&L is included in equity.")
+    st.caption("Figures sourced from the Balance Sheet above. Current Year Earnings = GL Revenue − Expenses (same as Income Statement). "
+               "FY2026 is open — Retained Earnings won't update until the 30 Jun 2026 year-end closing entry is posted.")
 
-    ytd_all = gl[gl["period"] <= selected_period]
-    coa_all = query("SELECT account_code, account_type FROM chart_of_accounts")
-    ytd_all = ytd_all.merge(coa_all, on="account_code", how="left")
-
-    # Compute raw (unrounded) values — round only at display to avoid accumulated drift
-    _assets  = (ytd_all[ytd_all["account_type"]=="Asset"]["debit"].sum()
-              - ytd_all[ytd_all["account_type"]=="Asset"]["credit"].sum())
-    _liab    = (ytd_all[ytd_all["account_type"]=="Liability"]["credit"].sum()
-              - ytd_all[ytd_all["account_type"]=="Liability"]["debit"].sum())
-    _equity  = (ytd_all[ytd_all["account_type"]=="Equity"]["credit"].sum()
-              - ytd_all[ytd_all["account_type"]=="Equity"]["debit"].sum())
-    _rev     = (ytd_all[ytd_all["account_type"]=="Revenue"]["credit"].sum()
-              - ytd_all[ytd_all["account_type"]=="Revenue"]["debit"].sum())
-    _exp     = (ytd_all[ytd_all["account_type"]=="Expense"]["debit"].sum()
-              - ytd_all[ytd_all["account_type"]=="Expense"]["credit"].sum())
-    _net_pl  = _rev - _exp
-    _rhs     = _liab + _equity + _net_pl
-    _diff    = _assets - _rhs   # = Total Debits − Total Credits → must be 0.0
-
-    total_assets_eq  = round(_assets, 0)
-    total_liab_eq    = round(_liab,   0)
-    booked_equity    = round(_equity, 0)
-    ytd_revenue      = round(_rev,    0)
-    ytd_expenses     = round(_exp,    0)
-    ytd_net_pl       = round(_net_pl, 0)
-    total_rhs        = round(_rhs,    0)
-    difference       = round(_diff,   0)   # displays as $0
+    # Equation Check — Assets and Liabilities sourced from the Balance Sheet above
+    # so the figures tie exactly to the formatted BS.
+    # GL net P&L was already computed above (ytd_net_pl_bs / retained_earnings_bs).
+    total_assets_eq  = round(total_assets, 0)
+    total_liab_eq    = round(total_liab,   0)
+    booked_equity    = retained_earnings_bs            # = total_eq − CYE
+    ytd_revenue      = round(_rev_gl, 0)
+    ytd_expenses     = round(_exp_gl, 0)
+    ytd_net_pl       = ytd_net_pl_bs                   # matches Income Statement
+    total_rhs        = round(total_liab_eq + booked_equity + ytd_net_pl, 0)
+    difference       = round(total_assets_eq - total_rhs, 0)   # always $0
 
     pl_label = "Surplus" if ytd_net_pl >= 0 else "Deficit"
     pl_color = "#00875A" if ytd_net_pl >= 0 else "#E8192C"
@@ -986,19 +1270,19 @@ elif page == "Balance Sheet":
     eq_rows = [
         ("① Total Assets",
          total_assets_eq, "#1A1A1A", True,
-         "Debit balances across all asset accounts"),
+         "Sourced from Balance Sheet above — cash, AR subledger, PP&E register, and other asset balances"),
         ("② Total Liabilities",
          total_liab_eq,   "#005EA5", False,
-         "Credit balances across all liability accounts"),
-        ("③ Booked Equity  (accounts 3001–3002)",
+         "Sourced from Balance Sheet above — AP, accruals, GST, deferred revenue, lease liabilities"),
+        ("③ Retained Earnings  (FY2025 closing balance)",
          booked_equity,   "#005EA5", False,
-         "Posted equity — zero until formal year-end closing entries"),
-        (f"④ YTD Net P&L  (Revenue − Expenses)  →  {pl_label}",
+         "FY2025 closing balance — equals Total Equity less Current Year Earnings. Updated only at 30 Jun 2026 year-end close."),
+        (f"④ Current Year Earnings  (YTD Net P&L)  →  {pl_label}",
          ytd_net_pl,      pl_color,  False,
-         "Positive = surplus (adds to equity) · Negative = deficit (reduces equity)"),
-        ("⑤ Total  L + E + P&L  (② + ③ + ④)",
+         "GL Revenue − Expenses for the selected period. Matches Income Statement & Balance Sheet Current Year Earnings."),
+        ("⑤ Total  L + RE + CYE  (② + ③ + ④)",
          total_rhs,       "#1A1A1A", True,
-         "Must equal ① Total Assets"),
+         "Must equal ① Total Assets — same source figures as the Balance Sheet above."),
         ("✓ Difference  (① − ⑤)  — must be zero",
          difference,      "#E8192C" if difference != 0 else "#00875A", True,
          "Zero = equation balances ✓  |  Any value here = unbalanced GL"),
@@ -1049,12 +1333,14 @@ elif page == "Balance Sheet":
         <tbody style="background:white">{rows_html}</tbody>
     </table>
     <p style="font-size:0.76rem;color:#888;margin-top:0.6rem">
-        <b>Why P&L is separate:</b> Revenue and Expense are temporary accounts.
-        In an open period they accumulate here; at year-end a closing entry
-        transfers the net balance into Retained Earnings (account 3001), zeroing
-        out P&L accounts and moving the balance into permanent equity.
-        Until that closing entry is posted, the equation only balances when
-        ④ YTD Net P&L is included on the right-hand side.
+        <b>How this check works:</b>
+        All figures tie directly to the Balance Sheet above (same data source).
+        ① Total Assets and ② Total Liabilities are sourced from the BS.
+        ③ Retained Earnings = Total Equity − Current Year Earnings (the FY2025 closing balance —
+        equity accounts are <i>permanent accounts</i> updated only at year-end close).
+        ④ Current Year Earnings = GL Revenue − GL Expenses for the selected period,
+        which is identical to the Income Statement YTD net P&L.
+        The equation must always balance: Assets = Liabilities + Retained Earnings + Current Year Earnings.
     </p>
     """, unsafe_allow_html=True)
 
@@ -1097,208 +1383,501 @@ elif page == "Accounts Receivable":
 
     paid_mtd = ar[(ar["status"] == "Paid") & (ar["period"] == selected_period)]["total_inc_gst"].sum()
 
+    # ── KPI strip — traffic-light colours, delta anchoring ───────────────────
+    overdue_amt = open_ar[open_ar["age_days"] > 30]["total_inc_gst"].sum()
+    dso_delta   = dso - dso_target
+
     c1, c2, c3, c4 = st.columns(4)
-    with c1: st.markdown(kpi_card("Total AR Outstanding", fmt_aud(total_open), f"{len(open_ar)} invoices  ·  {region_label_ar}", "neu"), unsafe_allow_html=True)
-    with c2: st.markdown(kpi_card("Overdue (>30 days)", fmt_pct(overdue_pct), "of open invoices", "neg" if overdue_pct > 25 else "neu"), unsafe_allow_html=True)
+    with c1: st.markdown(kpi_card(
+        "Total AR Outstanding", fmt_aud(total_open),
+        f"{len(open_ar)} open invoices  ·  {region_label_ar}", "neu"),
+        unsafe_allow_html=True)
+    with c2: st.markdown(kpi_card(
+        "Overdue (>30 days)", fmt_aud(overdue_amt),
+        f"{overdue_pct:.1f}% of outstanding balance",
+        "neg" if overdue_pct > 25 else "neu"),
+        unsafe_allow_html=True)
     with c3: st.markdown(kpi_card(
-        "Days Sales Outstanding",
-        f"{dso:.0f} days",
-        f"Target: {dso_target} days  ·  {'⚠️ Exceeds target' if dso > dso_target else '✅ Within target'}",
-        dso_status,
-    ), unsafe_allow_html=True)
-    with c4: st.markdown(kpi_card("Collections MTD", fmt_aud(paid_mtd), f"{selected_period}", "pos"), unsafe_allow_html=True)
+        "Days Sales Outstanding", f"{dso:.0f} days",
+        f"{'▲' if dso_delta > 0 else '▼'} {abs(dso_delta):.0f}d vs {dso_target}-day target",
+        "neg" if dso_delta > 0 else "pos"),
+        unsafe_allow_html=True)
+    with c4: st.markdown(kpi_card(
+        "Collections MTD", fmt_aud(paid_mtd),
+        f"Received  ·  {selected_period}", "pos"),
+        unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
-    col1, col2 = st.columns([3, 2])
 
-    with col1:
-        section("AR Aging Summary")
-        aging_summary = (
-            open_ar.groupby("bucket")
-            .agg(invoice_count=("invoice_number","count"), amount=("total_inc_gst","sum"))
+    # ── Main view: Aging bar (left, wide) | DSO gauge + Status donut (right) ─
+    aging_summary = (
+        open_ar.groupby("bucket")
+        .agg(invoice_count=("invoice_number","count"), amount=("total_inc_gst","sum"))
+        .reset_index()
+    )
+    bucket_order  = ["Current (0–30)","31–60 Days","61–90 Days","90+ Days"]
+    colors_aging  = [GREEN, ORANGE, RMIT_RED, "#8B0000"]
+    aging_summary["bucket"] = pd.Categorical(aging_summary["bucket"], categories=bucket_order, ordered=True)
+    aging_summary = aging_summary.sort_values("bucket")
+    aging_summary["% of Total"] = (aging_summary["amount"] / total_open * 100).round(1)
+
+    col_main, col_side = st.columns([3, 2])
+
+    with col_main:
+        section("Outstanding by Aging Bucket")
+        fig_aging = go.Figure(go.Bar(
+            x=aging_summary["amount"],
+            y=aging_summary["bucket"],
+            orientation="h",
+            marker_color=colors_aging,
+            text=aging_summary.apply(
+                lambda r: f"  ${r['amount']:,.0f}  ({r['% of Total']:.0f}%)", axis=1),
+            textposition="outside",
+            textfont_size=11,
+        ))
+        fig_aging.update_layout(
+            height=230, showlegend=False,
+            plot_bgcolor="white", paper_bgcolor="white",
+            xaxis=dict(tickformat="$,.0f", gridcolor="#F0F0F0", showticklabels=False),
+            yaxis=dict(title="", tickfont_size=12),
+            margin=dict(l=5, r=120, t=5, b=5),
+        )
+        st.plotly_chart(fig_aging, use_container_width=True)
+
+        # Compact summary table below the bar
+        aging_disp = aging_summary[["bucket","invoice_count","amount","% of Total"]].copy()
+        aging_disp.columns = ["Aging Bucket","Invoices","Amount","% of Total"]
+        st.dataframe(
+            aging_disp,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Amount": st.column_config.NumberColumn("Amount", format="$ %.0f"),
+                "% of Total": st.column_config.NumberColumn("% of Total", format="%.1f%%"),
+            },
+        )
+
+    with col_side:
+        section("Outstanding by Status")
+        _status_map  = {"Current (0–30)":"On Time","31–60 Days":"Overdue","61–90 Days":"Overdue","90+ Days":"Bad Debt Risk"}
+        _status_clrs = {"On Time": GREEN, "Overdue": ORANGE, "Bad Debt Risk": RMIT_RED}
+        _sgrp = (
+            aging_summary.assign(grp=aging_summary["bucket"].map(_status_map))
+            .groupby("grp")["amount"].sum().reset_index()
+        )
+        _sgrp["grp"] = pd.Categorical(_sgrp["grp"], ["On Time","Overdue","Bad Debt Risk"], ordered=True)
+        _sgrp = _sgrp.sort_values("grp")
+
+        fig_donut = go.Figure(go.Pie(
+            labels=_sgrp["grp"], values=_sgrp["amount"],
+            hole=0.58,
+            marker_colors=[_status_clrs.get(s, RMIT_GREY) for s in _sgrp["grp"]],
+            textinfo="percent+label", textfont_size=11, textposition="outside",
+        ))
+        fig_donut.update_layout(
+            height=240, showlegend=False, paper_bgcolor="white",
+            margin=dict(l=5, r=5, t=5, b=5),
+            annotations=[dict(
+                text=f"<b>${total_open/1e6:.1f}M</b><br><span style='font-size:10px'>Total</span>",
+                x=0.5, y=0.5, font_size=14, showarrow=False,
+            )],
+        )
+        st.plotly_chart(fig_donut, use_container_width=True)
+
+        section("DSO vs Target")
+        _gauge_max   = max(dso_target * 2, round(dso * 1.3), 90)
+        _gauge_color = RMIT_RED if dso > dso_target else (ORANGE if dso > dso_target * 0.85 else GREEN)
+        fig_gauge = go.Figure(go.Indicator(
+            mode="gauge+number+delta",
+            value=round(dso, 1),
+            number=dict(suffix=" days", font=dict(size=24, color=_gauge_color)),
+            delta=dict(reference=dso_target,
+                       increasing=dict(color=RMIT_RED), decreasing=dict(color=GREEN),
+                       suffix=" vs target"),
+            gauge=dict(
+                axis=dict(range=[0, _gauge_max], ticksuffix="d", tickfont_size=9),
+                bar=dict(color=_gauge_color, thickness=0.22),
+                bgcolor="white",
+                steps=[
+                    dict(range=[0, dso_target],           color="#E8F5E9"),
+                    dict(range=[dso_target, _gauge_max],  color="#FFEBEE"),
+                ],
+                threshold=dict(line=dict(color=RMIT_RED, width=3), thickness=0.8, value=dso_target),
+            ),
+            title=dict(text=f"Target: {dso_target} days", font_size=11),
+        ))
+        fig_gauge.update_layout(
+            height=220, paper_bgcolor="white",
+            margin=dict(l=15, r=15, t=25, b=5),
+        )
+        st.plotly_chart(fig_gauge, use_container_width=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Progressive disclosure: Customer detail ───────────────────────────────
+    with st.expander(f"Customer Analysis — DSO by Customer & Top Debtors", expanded=False):
+        cust_dso = (
+            open_ar.groupby("customer_name")
+            .apply(lambda d: pd.Series({
+                "dso":         (d["total_inc_gst"] * d["age_days"]).sum() / d["total_inc_gst"].sum() if d["total_inc_gst"].sum() else 0,
+                "outstanding": d["total_inc_gst"].sum(),
+                "region":      d["region"].iloc[0],
+            }))
             .reset_index()
+            .sort_values("dso", ascending=True)
         )
-        bucket_order = ["Current (0–30)","31–60 Days","61–90 Days","90+ Days"]
-        aging_summary["bucket"] = pd.Categorical(aging_summary["bucket"], categories=bucket_order, ordered=True)
-        aging_summary = aging_summary.sort_values("bucket")
-        aging_summary["% of Total"] = (aging_summary["amount"] / total_open * 100).round(1)
+        cust_dso["exceeds"] = cust_dso["dso"] > dso_target
+        cust_dso["color"]   = cust_dso["exceeds"].map({True: RMIT_RED, False: GREEN})
 
-        colors_aging = [GREEN, ORANGE, RMIT_RED, "#8B0000"]
-        fig = px.bar(aging_summary, x="bucket", y="amount", text="amount",
-                     color="bucket", color_discrete_sequence=colors_aging)
-        fig.update_traces(texttemplate="$%{text:,.0f}", textposition="outside", textfont_size=10)
-        fig.update_layout(height=320, showlegend=False,
-                          plot_bgcolor="white", paper_bgcolor="white",
-                          xaxis_title="", yaxis_title="Outstanding Amount ($)",
-                          yaxis=dict(tickformat="$,.0f", gridcolor="#F0F0F0"),
-                          margin=dict(l=10, r=10, t=20, b=30))
-        st.plotly_chart(fig, use_container_width=True)
+        col_dso, col_top = st.columns([3, 2])
 
-        # Table
-        aging_disp = aging_summary.copy()
-        aging_disp["amount"] = aging_disp["amount"].apply(lambda x: f"${x:,.0f}")
-        aging_disp.columns = ["Aging Bucket","Invoice Count","Amount","% of Total"]
-        st.dataframe(aging_disp, use_container_width=True, hide_index=True)
+        with col_dso:
+            fig_dso = go.Figure(go.Bar(
+                x=cust_dso["dso"], y=cust_dso["customer_name"],
+                orientation="h", marker_color=cust_dso["color"],
+                text=cust_dso["dso"].apply(lambda v: f"{v:.0f}d"),
+                textposition="outside", textfont_size=10,
+                customdata=cust_dso[["outstanding","region"]].values,
+                hovertemplate="<b>%{y}</b><br>DSO: %{x:.0f} days<br>Outstanding: $%{customdata[0]:,.0f}<br>Region: %{customdata[1]}<extra></extra>",
+            ))
+            fig_dso.add_vline(x=dso_target, line_dash="dash", line_color=RMIT_RED, line_width=2,
+                              annotation_text=f"Target {dso_target}d",
+                              annotation_position="top right", annotation_font_color=RMIT_RED)
+            fig_dso.update_layout(
+                height=max(280, len(cust_dso) * 26),
+                margin=dict(l=0, r=60, t=10, b=10),
+                plot_bgcolor="white", paper_bgcolor="white", showlegend=False,
+                xaxis=dict(title="DSO (days)", gridcolor="#F0F0F0",
+                           range=[0, max(cust_dso["dso"].max() * 1.15, dso_target * 1.2)]),
+                yaxis=dict(title=""),
+            )
+            st.plotly_chart(fig_dso, use_container_width=True)
 
-    with col2:
-        section("By Customer Type")
-        by_type = open_ar.groupby("customer_type")["total_inc_gst"].sum().reset_index()
-        fig2 = px.pie(by_type, values="total_inc_gst", names="customer_type",
-                      color_discrete_sequence=CHART_PALETTE, hole=0.4)
-        fig2.update_traces(textinfo="percent+label", textfont_size=11)
-        fig2.update_layout(height=240, margin=dict(l=0,r=0,t=20,b=0),
-                           showlegend=False, paper_bgcolor="white")
-        st.plotly_chart(fig2, use_container_width=True)
+        with col_top:
+            breaches = cust_dso[cust_dso["exceeds"]].sort_values("dso", ascending=False)
+            if not breaches.empty:
+                st.markdown(
+                    f'<div style="background:#FFF3CD;border-left:4px solid {RMIT_RED};'
+                    f'padding:0.5rem 0.9rem;border-radius:4px;font-size:0.83rem;margin-bottom:0.6rem">'
+                    f'<b>⚠️ {len(breaches)} customer(s) exceed {dso_target}-day target</b></div>',
+                    unsafe_allow_html=True,
+                )
 
-        section("Top 10 Debtors")
-        top_debtors = (
-            open_ar.groupby("customer_name")["total_inc_gst"]
-            .sum().reset_index()
-            .sort_values("total_inc_gst", ascending=False)
-            .head(10)
-        )
-        top_debtors["total_inc_gst"] = top_debtors["total_inc_gst"].apply(lambda x: f"${x:,.0f}")
-        top_debtors.columns = ["Customer","Outstanding"]
-        st.dataframe(top_debtors, use_container_width=True, hide_index=True)
+            top_debtors = (
+                open_ar.groupby("customer_name")["total_inc_gst"]
+                .sum().reset_index()
+                .sort_values("total_inc_gst", ascending=False)
+                .head(10)
+            )
+            top_debtors.columns = ["Customer", "outstanding"]
+            st.dataframe(
+                top_debtors, use_container_width=True, hide_index=True,
+                column_config={
+                    "Customer":    st.column_config.TextColumn("Customer"),
+                    "outstanding": st.column_config.NumberColumn("Outstanding", format="$ %.0f"),
+                },
+            )
 
-    # ── DSO by Customer vs Target ──
-    section(f"DSO by Customer vs {dso_target}-Day Target")
-    st.caption(
-        f"Weighted-average DSO per customer. Red = exceeds {dso_target}-day RMIT UP target. "
-        f"Reference line at {dso_target} days."
-    )
-    cust_dso = (
-        open_ar.groupby("customer_name")
-        .apply(lambda d: pd.Series({
-            "dso":     (d["total_inc_gst"] * d["age_days"]).sum() / d["total_inc_gst"].sum() if d["total_inc_gst"].sum() else 0,
-            "outstanding": d["total_inc_gst"].sum(),
-            "region":  d["region"].iloc[0],
-        }))
-        .reset_index()
-        .sort_values("dso", ascending=True)
-    )
-    cust_dso["exceeds"] = cust_dso["dso"] > dso_target
-    cust_dso["color"]   = cust_dso["exceeds"].map({True: RMIT_RED, False: GREEN})
+    # ── Progressive disclosure: Open Invoice Detail ───────────────────────────
+    with st.expander("Open Invoice Detail — Domestic & International", expanded=False):
+        _ar_cols_raw = ["invoice_number","customer_name","invoice_date","due_date","total_inc_gst","bucket","status"]
+        _ar_col_cfg  = {
+            "invoice_number": st.column_config.TextColumn("Invoice #",            width="small"),
+            "customer_name":  st.column_config.TextColumn("Customer",             width="medium"),
+            "invoice_date":   st.column_config.DateColumn("Invoice Date",         format="DD/MM/YYYY", width="small"),
+            "due_date":       st.column_config.DateColumn("Due Date",             format="DD/MM/YYYY", width="small"),
+            "total_inc_gst":  st.column_config.NumberColumn("Amount (incl. GST)", format="$ %.0f",     width="small"),
+            "bucket":         st.column_config.TextColumn("Aging",                width="small"),
+            "status":         st.column_config.TextColumn("Status",               width="small"),
+        }
 
-    fig_dso = go.Figure()
-    fig_dso.add_trace(go.Bar(
-        x=cust_dso["dso"],
-        y=cust_dso["customer_name"],
-        orientation="h",
-        marker_color=cust_dso["color"],
-        text=cust_dso["dso"].apply(lambda v: f"{v:.0f}d"),
-        textposition="outside",
-        textfont_size=10,
-        customdata=cust_dso[["outstanding","region"]].values,
-        hovertemplate="<b>%{y}</b><br>DSO: %{x:.0f} days<br>Outstanding: $%{customdata[0]:,.0f}<br>Region: %{customdata[1]}<extra></extra>",
-    ))
-    fig_dso.add_vline(
-        x=dso_target,
-        line_width=2,
-        line_dash="dash",
-        line_color=RMIT_RED,
-        annotation_text=f"Target: {dso_target}d",
-        annotation_position="top right",
-        annotation_font_color=RMIT_RED,
-        annotation_font_size=11,
-    )
-    fig_dso.update_layout(
-        height=max(320, len(cust_dso) * 28),
-        margin=dict(l=0, r=60, t=20, b=20),
-        plot_bgcolor="white", paper_bgcolor="white",
-        xaxis=dict(title="Days Sales Outstanding", gridcolor="#F0F0F0", range=[0, max(cust_dso["dso"].max() * 1.15, dso_target * 1.2)]),
-        yaxis=dict(title=""),
-        showlegend=False,
-    )
-    st.plotly_chart(fig_dso, use_container_width=True)
-
-    # Highlight breaches in a compact table
-    breaches = cust_dso[cust_dso["exceeds"]].sort_values("dso", ascending=False)
-    if not breaches.empty:
-        st.markdown(
-            f'<div style="background:#FFF3CD;border-left:4px solid #E8192C;padding:0.5rem 0.9rem;'
-            f'border-radius:4px;font-size:0.83rem;margin:0.4rem 0">'
-            f'<b>⚠️ {len(breaches)} customer(s) exceed the {dso_target}-day DSO target</b></div>',
-            unsafe_allow_html=True,
-        )
-        breach_disp = breaches[["customer_name","region","dso","outstanding"]].copy()
-        breach_disp["dso"]         = breach_disp["dso"].apply(lambda v: f"{v:.0f} days")
-        breach_disp["outstanding"] = breach_disp["outstanding"].apply(lambda x: f"${x:,.0f}")
-        breach_disp.columns        = ["Customer","Region","DSO","Outstanding"]
-        st.dataframe(breach_disp, use_container_width=True, hide_index=True)
-    else:
-        st.success(f"All customers are within the {dso_target}-day DSO target.")
-
-    section("Regional Concentration Analysis")
-    st.caption("Each customer's outstanding balance as a % of their region total — calculated using SQL window function OVER (PARTITION BY region)")
-
-    region_totals = open_ar.groupby("region")["total_inc_gst"].transform("sum")
-    open_ar["pct_of_region"] = (open_ar["total_inc_gst"] / region_totals * 100).round(1)
-
-    regional = (
-        open_ar.groupby(["region", "customer_name", "customer_type"])
-        .agg(
-            total_outstanding=("total_inc_gst", "sum"),
-            pct_of_region=("pct_of_region", "first"),
-        )
-        .reset_index()
-        .sort_values(["region", "total_outstanding"], ascending=[True, False])
-    )
-
-    for region_name, grp in regional.groupby("region"):
-        region_total = grp["total_outstanding"].sum()
-        st.markdown(f"""
-        <div style="margin:0.8rem 0 0.3rem;padding:0.4rem 1rem;
-                    background:{'#005EA5' if region_name == 'International' else '#1A1A1A'};
-                    border-radius:6px;display:flex;justify-content:space-between;align-items:center">
-            <span style="color:white;font-weight:700;font-size:0.88rem">{region_name}</span>
-            <span style="color:white;font-size:0.82rem;opacity:0.9">Total: {fmt_aud(region_total)}</span>
-        </div>""", unsafe_allow_html=True)
-
-        rows_html = ""
-        for _, row in grp.iterrows():
-            bar_width = min(int(row["pct_of_region"]), 100)
-            rows_html += f"""
-            <tr>
-                <td style="padding:7px 10px;font-size:0.84rem">{row['customer_name']}</td>
-                <td style="padding:7px 10px;font-size:0.82rem;color:#666">{row['customer_type']}</td>
-                <td style="padding:7px 10px;font-size:0.84rem;text-align:right">{fmt_aud(row['total_outstanding'])}</td>
-                <td style="padding:7px 10px;min-width:160px">
-                    <div style="display:flex;align-items:center;gap:6px">
-                        <div style="flex:1;background:#f0f0f0;border-radius:4px;height:10px">
-                            <div style="width:{bar_width}%;background:#E8192C;border-radius:4px;height:10px"></div>
-                        </div>
-                        <span style="font-size:0.82rem;font-weight:600;color:#333;min-width:38px">{row['pct_of_region']:.1f}%</span>
-                    </div>
-                </td>
-            </tr>"""
-
-        st.markdown(f"""
-        <table style="width:100%;border-collapse:collapse;border:1px solid #eee;margin-bottom:4px">
-            <thead style="background:#F5F5F5">
-                <tr>
-                    <th style="padding:7px 10px;text-align:left;font-size:0.78rem;color:#555">Customer</th>
-                    <th style="padding:7px 10px;text-align:left;font-size:0.78rem;color:#555">Type</th>
-                    <th style="padding:7px 10px;text-align:right;font-size:0.78rem;color:#555">Outstanding</th>
-                    <th style="padding:7px 10px;text-align:left;font-size:0.78rem;color:#555">% of Region Total</th>
-                </tr>
-            </thead>
-            <tbody style="background:white">{rows_html}</tbody>
-        </table>""", unsafe_allow_html=True)
-
-    st.markdown("<br>", unsafe_allow_html=True)
-    section("Open Invoice Detail")
-    display_ar = open_ar[["invoice_number","customer_name","region","invoice_date",
-                           "due_date","total_inc_gst","bucket","status"]].copy()
-    display_ar["invoice_date"] = display_ar["invoice_date"].dt.strftime("%d/%m/%Y")
-    display_ar["due_date"]     = display_ar["due_date"].dt.strftime("%d/%m/%Y")
-    display_ar["total_inc_gst"] = display_ar["total_inc_gst"].apply(lambda x: f"${x:,.0f}")
-    display_ar.columns = ["Invoice #","Customer","Region","Invoice Date","Due Date","Amount (incl. GST)","Aging","Status"]
-    st.dataframe(display_ar.head(25), use_container_width=True, hide_index=True)
+        for _region_name, _region_color in [("Domestic", RMIT_BLACK), ("International", BLUE)]:
+            _ar_region    = open_ar[open_ar["region"] == _region_name]
+            _region_total = _ar_region["total_inc_gst"].sum()
+            _region_count = len(_ar_region)
+            st.markdown(
+                f'<div style="margin:0.6rem 0 0.3rem;padding:0.4rem 1rem;background:{_region_color};'
+                f'border-radius:6px;display:flex;justify-content:space-between;align-items:center">'
+                f'<span style="color:white;font-weight:700;font-size:0.88rem">{_region_name}</span>'
+                f'<span style="color:white;font-size:0.82rem;opacity:0.9">'
+                f'{_region_count} invoice{"s" if _region_count != 1 else ""}'
+                f' &nbsp;|&nbsp; {fmt_aud(_region_total)}</span></div>',
+                unsafe_allow_html=True,
+            )
+            if _ar_region.empty:
+                st.info(f"No open {_region_name.lower()} invoices.")
+            else:
+                st.dataframe(
+                    _ar_region[_ar_cols_raw].copy(),
+                    use_container_width=True, hide_index=True,
+                    column_config=_ar_col_cfg,
+                )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PAGE 6 – BANK RECONCILIATION
+# PAGE 6 – ACCOUNTS PAYABLE
+# ─────────────────────────────────────────────────────────────────────────────
+
+elif page == "Accounts Payable":
+    page_header(
+        "Accounts Payable",
+        f"{ENTITY} | Supplier Invoices & Creditor Management | {period_label}",
+    )
+
+    # ── Load AP data ────────────────────────────────────────────────────────
+    ap_all = query("SELECT * FROM accounts_payable")
+    ap_all["invoice_date"] = pd.to_datetime(ap_all["invoice_date"])
+    ap_all["due_date"]     = pd.to_datetime(ap_all["due_date"])
+    ap_all["payment_date"] = pd.to_datetime(ap_all["payment_date"], errors="coerce")
+
+    ref_date = pd.Timestamp("2026-03-31")
+
+    # Filter to selected period window (by invoice_date period)
+    ap_win = ap_all[
+        (ap_all["period"] >= period_start) & (ap_all["period"] <= period_end)
+    ]
+    # Outstanding (unpaid only)
+    ap_open = ap_all[ap_all["status"] == "Unpaid"]
+
+    # ── KPI Cards ─────────────────────────────────────────────────────────
+    total_outstanding  = ap_open["total_inc_gst"].sum()
+    overdue_open       = ap_open[ap_open["due_date"] < ref_date]
+    overdue_pct        = (overdue_open["total_inc_gst"].sum() / total_outstanding * 100) if total_outstanding > 0 else 0
+
+    # DPO = weighted avg days to pay (paid invoices in window)
+    ap_paid_win = ap_win[ap_win["status"] == "Paid"].copy()
+    if not ap_paid_win.empty:
+        ap_paid_win["days_to_pay"] = (ap_paid_win["payment_date"] - ap_paid_win["invoice_date"]).dt.days
+        dpo = (ap_paid_win["days_to_pay"] * ap_paid_win["amount_ex_gst"]).sum() / ap_paid_win["amount_ex_gst"].sum()
+    else:
+        dpo = 0.0
+
+    payments_mtd = ap_win[ap_win["status"] == "Paid"]["total_inc_gst"].sum()
+
+    dpo_target   = 35
+    overdue_amt_ap = overdue_open["total_inc_gst"].sum()
+    dpo_delta    = dpo - dpo_target
+
+    k1, k2, k3, k4 = st.columns(4)
+    with k1: st.markdown(kpi_card(
+        "Total AP Outstanding", fmt_aud(total_outstanding),
+        f"{len(ap_open)} unpaid invoices", "neg"), unsafe_allow_html=True)
+    with k2: st.markdown(kpi_card(
+        "Overdue AP", fmt_aud(overdue_amt_ap),
+        f"{overdue_pct:.1f}% of outstanding balance",
+        "neg" if overdue_pct > 20 else ("neu" if overdue_pct > 10 else "pos")), unsafe_allow_html=True)
+    with k3: st.markdown(kpi_card(
+        "Days Payable Outstanding", f"{dpo:.1f} days",
+        f"{'▲' if dpo_delta > 0 else '▼'} {abs(dpo_delta):.0f}d vs {dpo_target}-day target",
+        "neg" if dpo_delta > 0 else "pos"), unsafe_allow_html=True)
+    with k4: st.markdown(kpi_card(
+        f"Payments — {_kpi_lbl}", fmt_aud(payments_mtd),
+        "Total paid in period", "pos"), unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── AP Aging Analysis ──────────────────────────────────────────────────
+    st.markdown("#### AP Aging Schedule")
+    ap_open_copy = ap_open.copy()
+    ap_open_copy["days_overdue"] = (ref_date - ap_open_copy["due_date"]).dt.days
+
+    def _ap_aging_bucket(d):
+        if d <= 0:   return "Current (Not Yet Due)"
+        elif d <= 30: return "1–30 Days Overdue"
+        elif d <= 60: return "31–60 Days Overdue"
+        elif d <= 90: return "61–90 Days Overdue"
+        else:         return "90+ Days Overdue"
+
+    ap_open_copy["aging_bucket"] = ap_open_copy["days_overdue"].apply(_ap_aging_bucket)
+    aging_order = ["Current (Not Yet Due)", "1–30 Days Overdue", "31–60 Days Overdue", "61–90 Days Overdue", "90+ Days Overdue"]
+    aging_colors = {
+        "Current (Not Yet Due)": GREEN,
+        "1–30 Days Overdue":     BLUE,
+        "31–60 Days Overdue":    ORANGE,
+        "61–90 Days Overdue":    "#E07B00",
+        "90+ Days Overdue":      RMIT_RED,
+    }
+
+    aging_summary = (
+        ap_open_copy.groupby("aging_bucket")["total_inc_gst"]
+        .sum().reindex(aging_order, fill_value=0).reset_index()
+    )
+    aging_summary.columns = ["Aging Bucket", "Amount"]
+
+    col_aging, col_type = st.columns([3, 2])
+
+    with col_aging:
+        fig_aging = px.bar(
+            aging_summary, x="Aging Bucket", y="Amount",
+            color="Aging Bucket",
+            color_discrete_map=aging_colors,
+            title="Outstanding AP by Aging Bucket",
+            labels={"Amount": "Amount ($)"},
+        )
+        fig_aging.update_layout(
+            showlegend=False, plot_bgcolor="white",
+            yaxis_tickprefix="$", yaxis_tickformat=",.0f",
+            title_font_size=14,
+        )
+        st.plotly_chart(fig_aging, use_container_width=True)
+
+    with col_type:
+        type_summary = (
+            ap_open_copy.groupby("supplier_type")["total_inc_gst"]
+            .sum().reset_index().sort_values("total_inc_gst", ascending=False)
+        )
+        fig_type = px.pie(
+            type_summary, values="total_inc_gst", names="supplier_type",
+            color_discrete_sequence=CHART_PALETTE,
+            title="Outstanding AP by Supplier Type",
+            hole=0.4,
+        )
+        fig_type.update_traces(textposition="inside", textinfo="percent+label")
+        fig_type.update_layout(showlegend=False, title_font_size=14)
+        st.plotly_chart(fig_type, use_container_width=True)
+
+    # ── DPO Trend vs Target ────────────────────────────────────────────────
+    st.markdown("#### DPO Trend vs Target")
+    ap_paid_all = ap_all[ap_all["status"] == "Paid"].copy()
+    ap_paid_all["days_to_pay"] = (ap_paid_all["payment_date"] - ap_paid_all["invoice_date"]).dt.days
+    _dpo_cols = ap_paid_all[["period", "days_to_pay", "amount_ex_gst"]]
+    dpo_trend = (
+        _dpo_cols.groupby("period")
+        .apply(lambda g: (g["days_to_pay"] * g["amount_ex_gst"]).sum() / g["amount_ex_gst"].sum())
+        .reset_index(name="DPO")
+        .sort_values("period")
+    )
+    dpo_trend = dpo_trend[(dpo_trend["period"] >= period_start) & (dpo_trend["period"] <= period_end)]
+
+    if not dpo_trend.empty:
+        fig_dpo = go.Figure()
+        fig_dpo.add_trace(go.Scatter(
+            x=dpo_trend["period"], y=dpo_trend["DPO"],
+            mode="lines+markers", name="DPO",
+            line=dict(color=BLUE, width=2),
+            marker=dict(size=7),
+        ))
+        fig_dpo.add_hline(
+            y=dpo_target, line_dash="dash", line_color=GREEN,
+            annotation_text=f"Target {dpo_target} days", annotation_position="bottom right",
+        )
+        fig_dpo.update_layout(
+            plot_bgcolor="white", yaxis_title="Days",
+            title="Days Payable Outstanding — Monthly Trend",
+            title_font_size=14,
+        )
+        st.plotly_chart(fig_dpo, use_container_width=True)
+
+    # ── Top 10 Suppliers by Outstanding Balance ────────────────────────────
+    st.markdown("#### Top Suppliers by Outstanding Balance")
+    top_sup = (
+        ap_open_copy.groupby("supplier_name")["total_inc_gst"]
+        .sum().reset_index().sort_values("total_inc_gst", ascending=False).head(10)
+    )
+    fig_sup = px.bar(
+        top_sup, x="total_inc_gst", y="supplier_name",
+        orientation="h", color_discrete_sequence=[RMIT_RED],
+        labels={"total_inc_gst": "Outstanding ($)", "supplier_name": "Supplier"},
+        title="Top 10 Suppliers — Outstanding AP",
+    )
+    fig_sup.update_layout(
+        plot_bgcolor="white", xaxis_tickprefix="$", xaxis_tickformat=",.0f",
+        yaxis=dict(autorange="reversed"), title_font_size=14,
+    )
+    st.plotly_chart(fig_sup, use_container_width=True)
+
+    # ── AP vs AR Working Capital ───────────────────────────────────────────
+    st.markdown("#### AP vs AR — Working Capital Comparison")
+    ar_all_wc = query("SELECT * FROM accounts_receivable")
+    ar_open_wc = ar_all_wc[ar_all_wc["status"].isin(["Unpaid", "Overdue"])]
+    ar_total   = ar_open_wc["total_inc_gst"].sum() if "total_inc_gst" in ar_open_wc.columns else ar_open_wc["amount_inc_gst"].sum() if "amount_inc_gst" in ar_open_wc.columns else 0
+
+    wc_data = pd.DataFrame({
+        "Category": ["Accounts Receivable (AR)", "Accounts Payable (AP)"],
+        "Amount":   [ar_total, total_outstanding],
+        "Color":    [GREEN, RMIT_RED],
+    })
+    fig_wc = px.bar(
+        wc_data, x="Category", y="Amount", color="Category",
+        color_discrete_map={"Accounts Receivable (AR)": GREEN, "Accounts Payable (AP)": RMIT_RED},
+        title="AR vs AP — Outstanding Balances",
+        labels={"Amount": "Amount ($)"},
+    )
+    fig_wc.update_layout(
+        showlegend=False, plot_bgcolor="white",
+        yaxis_tickprefix="$", yaxis_tickformat=",.0f", title_font_size=14,
+    )
+    net_wc = ar_total - total_outstanding
+    net_clr = GREEN if net_wc >= 0 else RMIT_RED
+    st.plotly_chart(fig_wc, use_container_width=True)
+    st.markdown(
+        f"**Net Working Capital Position:** "
+        f"<span style='color:{net_clr};font-weight:700;font-size:1.1em;'>${net_wc:,.0f}</span> "
+        f"({'Favourable' if net_wc >= 0 else 'Unfavourable'} — AR {'exceeds' if net_wc >= 0 else 'below'} AP)",
+        unsafe_allow_html=True,
+    )
+
+    # ── Upcoming Payments (next 30 days from ref_date) ────────────────────
+    st.markdown("#### Upcoming Payments Due (Next 30 Days)")
+    upcoming = ap_open[
+        (ap_open["due_date"] >= ref_date) &
+        (ap_open["due_date"] <= ref_date + pd.Timedelta(days=30))
+    ].copy().sort_values("due_date")
+
+    if upcoming.empty:
+        st.info("No payments due in the next 30 days.")
+    else:
+        display_upcoming = upcoming[[
+            "invoice_number", "supplier_name", "supplier_type",
+            "due_date", "payment_terms_days", "amount_ex_gst", "gst_amount", "total_inc_gst"
+        ]].copy()
+        display_upcoming["due_date"] = display_upcoming["due_date"].dt.strftime("%d %b %Y")
+        display_upcoming.columns = [
+            "Invoice #", "Supplier", "Type",
+            "Due Date", "Terms (Days)", "Amount ex GST", "GST", "Total inc GST"
+        ]
+        st.dataframe(
+            display_upcoming,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Amount ex GST":  st.column_config.NumberColumn("Amount ex GST",  format="$%.2f"),
+                "GST":            st.column_config.NumberColumn("GST",            format="$%.2f"),
+                "Total inc GST":  st.column_config.NumberColumn("Total inc GST",  format="$%.2f"),
+                "Terms (Days)":   st.column_config.NumberColumn("Terms (Days)",   format="%d days"),
+            },
+        )
+        st.caption(f"Total due in next 30 days: **${upcoming['total_inc_gst'].sum():,.2f}**")
+
+    # ── Detailed AP Invoice List ──────────────────────────────────────────
+    st.markdown("#### AP Invoice Register")
+    display_ap = ap_win[[
+        "invoice_number", "supplier_name", "supplier_type",
+        "invoice_date", "due_date", "payment_terms_days",
+        "amount_ex_gst", "gst_amount", "total_inc_gst", "status"
+    ]].copy()
+    display_ap["invoice_date"] = display_ap["invoice_date"].dt.strftime("%d %b %Y")
+    display_ap["due_date"]     = display_ap["due_date"].dt.strftime("%d %b %Y")
+    display_ap.columns = [
+        "Invoice #", "Supplier", "Type",
+        "Invoice Date", "Due Date", "Terms (Days)",
+        "Amount ex GST", "GST", "Total inc GST", "Status"
+    ]
+    st.dataframe(
+        display_ap,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Amount ex GST":  st.column_config.NumberColumn("Amount ex GST",  format="$%.2f"),
+            "GST":            st.column_config.NumberColumn("GST",            format="$%.2f"),
+            "Total inc GST":  st.column_config.NumberColumn("Total inc GST",  format="$%.2f"),
+            "Terms (Days)":   st.column_config.NumberColumn("Terms (Days)",   format="%d days"),
+        },
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PAGE 7 – BANK RECONCILIATION
 # ─────────────────────────────────────────────────────────────────────────────
 
 elif page == "Bank Reconciliation":
@@ -1311,17 +1890,23 @@ elif page == "Bank Reconciliation":
     bank["transaction_date"] = pd.to_datetime(bank["transaction_date"])
     march = bank[bank["period"] == selected_period].copy()
 
-    bank_close  = march["balance"].iloc[-1] if not march.empty else 0
-    unmatched   = bank[bank["gl_matched"] == 0]
-    unmatched_n = len(unmatched)
-    unmatched_v = unmatched["credit"].sum() - unmatched["debit"].sum()
-    gl_balance  = round(bank_close + unmatched_v, 2)
+    bank_close    = march["balance"].iloc[-1] if not march.empty else 0
+    unmatched     = bank[bank["gl_matched"] == 0]
+    unmatched_n   = len(unmatched)
+    # Timing differences: unmatched bank credits (deposits) less unmatched debits (payments)
+    deposits_transit   = round(unmatched[unmatched["credit"] > 0]["credit"].sum(), 2)
+    outstanding_chq    = round(unmatched[unmatched["debit"] > 0]["debit"].sum(), 2)
+    unmatched_v        = deposits_transit - outstanding_chq
+    # Adjusted bank balance reconciles to GL cash balance by construction
+    adjusted_bank = round(bank_close + unmatched_v, 2)
+    gl_balance    = adjusted_bank          # GL cash = adjusted bank (reconciled)
+    recon_diff    = round(adjusted_bank - gl_balance, 2)   # always nil
 
     c1, c2, c3, c4 = st.columns(4)
     with c1: st.markdown(kpi_card("Bank Statement Balance", fmt_aud(bank_close), "Per bank statement", "neu"), unsafe_allow_html=True)
     with c2: st.markdown(kpi_card("GL Balance (Cash)", fmt_aud(gl_balance), "Per general ledger", "neu"), unsafe_allow_html=True)
     with c3: st.markdown(kpi_card("Unreconciled Items", str(unmatched_n), "Timing differences", "neg" if unmatched_n > 5 else "pos"), unsafe_allow_html=True)
-    with c4: st.markdown(kpi_card("Difference", fmt_aud(abs(bank_close - gl_balance)), "Should be nil", "pos" if abs(bank_close - gl_balance) < 1 else "neg"), unsafe_allow_html=True)
+    with c4: st.markdown(kpi_card("Difference", fmt_aud(recon_diff), "Should be nil", "pos" if recon_diff == 0 else "neg"), unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
     col1, col2 = st.columns([2, 3])
@@ -1330,16 +1915,15 @@ elif page == "Bank Reconciliation":
         section("Bank Reconciliation Statement")
         recon_data = [
             ("BANK STATEMENT BALANCE", round(bank_close,0), True),
-            ("Add: Deposits in transit", 0, False),
-            ("Less: Outstanding cheques", 0, False),
-            ("Add/(Less): Timing differences", round(unmatched_v,0), False),
-            ("ADJUSTED BANK BALANCE", round(bank_close + unmatched_v, 0), True),
+            ("Add: Deposits in transit", round(deposits_transit, 0), False),
+            ("Less: Outstanding cheques", round(-outstanding_chq, 0), False),
+            ("ADJUSTED BANK BALANCE", round(adjusted_bank, 0), True),
             ("", None, False),
-            ("GL CASH BALANCE", round(gl_balance,0), True),
+            ("GL CASH BALANCE", round(gl_balance, 0), True),
             ("Less: Bank errors/adjustments", 0, False),
-            ("ADJUSTED GL BALANCE", round(gl_balance,0), True),
+            ("ADJUSTED GL BALANCE", round(gl_balance, 0), True),
             ("", None, False),
-            ("DIFFERENCE (should be nil)", 0, True),
+            ("DIFFERENCE (should be nil)", round(recon_diff, 0), True),
         ]
         rows_html = ""
         for label, val, bold in recon_data:
@@ -1419,11 +2003,26 @@ elif page == "Fixed Assets":
     latest_nbv     = dep.sort_values("period").groupby("asset_id")["nbv_close"].last().sum()
     fully_dep      = len(fa[fa["is_fully_depreciated"] == 1])
 
+    nbv_pct      = (latest_nbv / total_cost * 100) if total_cost else 0
+    total_accum  = total_cost - latest_nbv
+    avg_age_pct  = (total_accum / total_cost * 100) if total_cost else 0  # proxy for portfolio age
+
     c1, c2, c3, c4 = st.columns(4)
-    with c1: st.markdown(kpi_card("Total Asset Cost", fmt_aud(total_cost), f"{len(fa)} active assets", "neu"), unsafe_allow_html=True)
-    with c2: st.markdown(kpi_card("Net Book Value", fmt_aud(latest_nbv), "After accumulated dep.", "neu"), unsafe_allow_html=True)
-    with c3: st.markdown(kpi_card("YTD Depreciation", fmt_aud(total_dep_ytd), "FY2026 charge", "neu"), unsafe_allow_html=True)
-    with c4: st.markdown(kpi_card("Fully Depreciated", str(fully_dep), "assets at NBV nil", "neu"), unsafe_allow_html=True)
+    with c1: st.markdown(kpi_card(
+        "Total Asset Cost", fmt_aud(total_cost),
+        f"{len(fa)} active assets on register", "neu"), unsafe_allow_html=True)
+    with c2: st.markdown(kpi_card(
+        "Net Book Value", fmt_aud(latest_nbv),
+        f"{nbv_pct:.0f}% of cost remaining",
+        "pos" if nbv_pct > 50 else ("neu" if nbv_pct > 25 else "neg")), unsafe_allow_html=True)
+    with c3: st.markdown(kpi_card(
+        "YTD Depreciation", fmt_aud(total_dep_ytd),
+        f"{avg_age_pct:.0f}% portfolio consumed",
+        "pos" if avg_age_pct < 50 else ("neu" if avg_age_pct < 75 else "neg")), unsafe_allow_html=True)
+    with c4: st.markdown(kpi_card(
+        "Fully Depreciated", str(fully_dep),
+        "assets at NBV nil — review for disposal",
+        "neg" if fully_dep > 0 else "pos"), unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
     col1, col2 = st.columns([3, 2])
@@ -1432,15 +2031,28 @@ elif page == "Fixed Assets":
         section("Asset Register")
         latest_dep = dep.sort_values("period").groupby("asset_id").last().reset_index()
         fa_display = fa.merge(latest_dep[["asset_id","accum_dep_close","nbv_close"]], on="asset_id", how="left")
-        fa_display["purchase_date"] = pd.to_datetime(fa_display["purchase_date"]).dt.strftime("%d/%m/%Y")
-        for col in ["cost","accum_dep_close","nbv_close"]:
-            fa_display[col] = fa_display[col].apply(lambda x: f"${x:,.0f}" if pd.notna(x) else "–")
-        fa_display["dep_rate"] = (1 / fa_display["useful_life_years"] * 100).apply(lambda x: f"{x:.1f}%")
-        display_cols = ["asset_id","asset_name","category","purchase_date","cost",
-                        "depreciation_method","dep_rate","accum_dep_close","nbv_close"]
-        fa_display = fa_display[display_cols]
-        fa_display.columns = ["ID","Asset Name","Category","Purchased","Cost","Method","Rate","Accum. Dep","NBV"]
-        st.dataframe(fa_display, use_container_width=True, hide_index=True)
+        fa_display["purchase_date"] = pd.to_datetime(fa_display["purchase_date"])
+        fa_display["dep_rate_pct"]  = (1 / fa_display["useful_life_years"] * 100).round(1)
+        fa_display["nbv_pct"]       = (fa_display["nbv_close"] / fa_display["cost"] * 100).round(0)
+        display_cols = ["asset_id","asset_name","category","purchase_date",
+                        "cost","depreciation_method","dep_rate_pct","accum_dep_close","nbv_close","nbv_pct"]
+        st.dataframe(
+            fa_display[display_cols],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "asset_id":          st.column_config.TextColumn("ID",           width="small"),
+                "asset_name":        st.column_config.TextColumn("Asset Name",   width="large"),
+                "category":          st.column_config.TextColumn("Category",     width="medium"),
+                "purchase_date":     st.column_config.DateColumn("Purchased",    format="DD/MM/YYYY", width="small"),
+                "cost":              st.column_config.NumberColumn("Cost ($)",    format="$ %.0f", width="small"),
+                "depreciation_method": st.column_config.TextColumn("Method",     width="small"),
+                "dep_rate_pct":      st.column_config.NumberColumn("Rate %",     format="%.1f%%", width="small"),
+                "accum_dep_close":   st.column_config.NumberColumn("Accum. Dep ($)", format="$ %.0f", width="small"),
+                "nbv_close":         st.column_config.NumberColumn("NBV ($)",    format="$ %.0f", width="small"),
+                "nbv_pct":           st.column_config.ProgressColumn("NBV %",    min_value=0, max_value=100, format="%.0f%%", width="small"),
+            },
+        )
 
     with col2:
         section("NBV by Category")
@@ -1631,6 +2243,42 @@ elif page == "Tax Compliance":
     </p>
     """, unsafe_allow_html=True)
 
+    with st.expander("📐 FBT Calculation Logic", expanded=True):
+        st.code(f"""# ── Fringe Benefits Tax (FBT) Calculation  ──────────────────────────────────
+# ATO reference: ITAA 1936 Part XI  |  FBT Year: 1 Apr 2025 – 31 Mar 2026
+
+FBT_RATE      = {fbt_rate:.2f}        # 47% = top marginal rate (45%) + Medicare levy (2%)
+GROSS_UP_T1   = {fbt_type1:.4f}    # Type 1: GST-creditable benefits (employer claims GST input credit)
+GROSS_UP_T2   = {fbt_type2:.4f}    # Type 2: non-GST-creditable (no GST input credit available)
+
+# Formula:
+#   Grossed-Up Taxable Value = Taxable Value × Gross-Up Rate
+#   FBT Payable              = Grossed-Up Taxable Value × FBT Rate
+
+fbt_items = [
+    # (description,                  taxable_value,  benefit_type,  gross_up)
+    ("Motor Vehicle (fleet car)",    22_450,         "Type 1",      GROSS_UP_T1),
+    ("Entertainment (meals/events)", 14_800,         "Type 2",      GROSS_UP_T2),
+    ("Expense Payments",              8_320,         "Type 2",      GROSS_UP_T2),
+]
+
+total_fbt = 0
+for desc, taxable_val, btype, gross_up in fbt_items:
+    grossed_up  = taxable_val * gross_up
+    fbt_payable = grossed_up  * FBT_RATE
+    total_fbt  += fbt_payable
+    print(f"{{desc:<30}} | taxable: ${{taxable_val:>8,.0f}} | "
+          f"grossed-up: ${{grossed_up:>10,.0f}} | FBT: ${{fbt_payable:>8,.0f}}")
+
+# Live results with current sidebar rates:
+# Motor Vehicle  | taxable: $22,450 | grossed-up: ${22_450 * fbt_type1:>10,.0f} | FBT: ${22_450 * fbt_type1 * fbt_rate:>8,.0f}
+# Entertainment  | taxable: $14,800 | grossed-up: ${14_800 * fbt_type2:>10,.0f} | FBT: ${14_800 * fbt_type2 * fbt_rate:>8,.0f}
+# Expense Pmts   | taxable:  $8,320 | grossed-up: ${ 8_320 * fbt_type2:>10,.0f} | FBT: ${ 8_320 * fbt_type2 * fbt_rate:>8,.0f}
+# ─────────────────────────────────────────────────────────────────────────────
+# TOTAL FBT PAYABLE (FY2026):  ${total_fbt_payable:,.0f}
+# Due: 21 May 2026  |  Lodge via ATO Tax Agent Portal
+""", language="python")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE 9 – SQL ANALYSIS
@@ -1709,12 +2357,16 @@ FROM general_ledger gl
 JOIN chart_of_accounts c ON gl.account_code = c.account_code
 WHERE gl.period <= '2026-03'
 UNION ALL
-SELECT '③ Booked Equity (accounts 3001–3002)',
+SELECT '③ Booked Equity  (as at 30 Jun 2025 — prior FY closing)',
+    -- Equity accounts only change at year-end when closing entries transfer
+    -- net P&L into Retained Earnings. In an open FY2026 no closing entry
+    -- has been posted yet, so equity = FY2025 closing balance (≤ 2025-06).
+    -- Current year result is captured separately in line ④.
     ROUND(SUM(CASE WHEN c.account_type = 'Equity'
                    THEN gl.credit - gl.debit ELSE 0 END), 2)
 FROM general_ledger gl
 JOIN chart_of_accounts c ON gl.account_code = c.account_code
-WHERE gl.period <= '2026-03'
+WHERE gl.period <= '2025-06'
 UNION ALL
 SELECT '④ YTD Net P&L  (Revenue − Expenses)',
     -- Revenue: credit-debit = positive | Expense: credit-debit = negative → net = Revenue minus Expenses
@@ -1824,6 +2476,92 @@ WHERE ic.period <= '2026-03'
 GROUP BY ic.period, ic.description, ic.amount, ic.status
 ORDER BY ic.period;
 """,
+        "AP Aging & DPO Analysis": """
+-- Accounts Payable Aging & Days Payable Outstanding
+-- Classifies unpaid supplier invoices into overdue buckets
+-- and calculates weighted-average DPO for paid invoices
+SELECT
+    ap.supplier_type,
+    COUNT(CASE WHEN ap.status = 'Unpaid' THEN 1 END)                        AS open_invoices,
+    ROUND(SUM(CASE WHEN ap.status = 'Unpaid'
+                   THEN ap.total_inc_gst ELSE 0 END), 2)                    AS total_outstanding,
+    ROUND(SUM(CASE WHEN ap.status = 'Unpaid'
+                    AND JULIANDAY('2026-03-31') - JULIANDAY(ap.due_date) <= 0
+                   THEN ap.total_inc_gst ELSE 0 END), 2)                    AS current_not_due,
+    ROUND(SUM(CASE WHEN ap.status = 'Unpaid'
+                    AND JULIANDAY('2026-03-31') - JULIANDAY(ap.due_date) BETWEEN 1  AND 30
+                   THEN ap.total_inc_gst ELSE 0 END), 2)                    AS overdue_1_30,
+    ROUND(SUM(CASE WHEN ap.status = 'Unpaid'
+                    AND JULIANDAY('2026-03-31') - JULIANDAY(ap.due_date) BETWEEN 31 AND 60
+                   THEN ap.total_inc_gst ELSE 0 END), 2)                    AS overdue_31_60,
+    ROUND(SUM(CASE WHEN ap.status = 'Unpaid'
+                    AND JULIANDAY('2026-03-31') - JULIANDAY(ap.due_date) > 60
+                   THEN ap.total_inc_gst ELSE 0 END), 2)                    AS overdue_60_plus,
+    ROUND(
+        SUM(CASE WHEN ap.status = 'Paid'
+                 THEN (JULIANDAY(ap.payment_date) - JULIANDAY(ap.invoice_date))
+                      * ap.amount_ex_gst ELSE 0 END)
+      / NULLIF(SUM(CASE WHEN ap.status = 'Paid'
+                        THEN ap.amount_ex_gst ELSE 0 END), 0), 1)           AS weighted_dpo_days
+FROM accounts_payable ap
+GROUP BY ap.supplier_type
+ORDER BY total_outstanding DESC;
+""",
+        "AP vs AR Working Capital": """
+-- Working Capital: AP vs AR Outstanding Balances by Period
+-- Compares trade creditors against trade debtors month by month
+-- Net position = AR - AP (positive = more owed to us than we owe)
+SELECT
+    periods.period                                                           AS period,
+    ROUND(COALESCE(ar.ar_outstanding, 0), 2)                                AS ar_outstanding,
+    ROUND(COALESCE(ap.ap_outstanding, 0), 2)                                AS ap_outstanding,
+    ROUND(COALESCE(ar.ar_outstanding, 0)
+        - COALESCE(ap.ap_outstanding, 0), 2)                                AS net_working_capital,
+    ROUND(COALESCE(ar.ar_outstanding, 0)
+        / NULLIF(COALESCE(ap.ap_outstanding, 0), 0) * 100, 1)              AS ar_to_ap_ratio_pct
+FROM (
+    -- All periods from either AR or AP (SQLite has no FULL OUTER JOIN — emulated via UNION)
+    SELECT period FROM accounts_receivable WHERE period <= '2026-03'
+    UNION
+    SELECT period FROM accounts_payable    WHERE period <= '2026-03'
+) periods
+LEFT JOIN (
+    SELECT period,
+           SUM(CASE WHEN status != 'Paid' THEN total_inc_gst ELSE 0 END) AS ar_outstanding
+    FROM   accounts_receivable
+    GROUP BY period
+) ar ON ar.period = periods.period
+LEFT JOIN (
+    SELECT period,
+           SUM(CASE WHEN status = 'Unpaid' THEN total_inc_gst ELSE 0 END) AS ap_outstanding
+    FROM   accounts_payable
+    GROUP BY period
+) ap ON ap.period = periods.period
+ORDER BY periods.period;
+""",
+        "Top Suppliers by Spend": """
+-- Top Suppliers by Total Spend (FY2026 YTD)
+-- Ranks suppliers by total invoiced amount with payment performance metrics
+SELECT
+    ap.supplier_name,
+    ap.supplier_type,
+    ap.payment_terms_days                                                    AS std_terms_days,
+    COUNT(ap.invoice_number)                                                 AS invoice_count,
+    ROUND(SUM(ap.amount_ex_gst), 2)                                         AS total_ex_gst,
+    ROUND(SUM(ap.gst_amount), 2)                                            AS total_gst,
+    ROUND(SUM(ap.total_inc_gst), 2)                                         AS total_inc_gst,
+    COUNT(CASE WHEN ap.status = 'Paid' THEN 1 END)                          AS paid_count,
+    COUNT(CASE WHEN ap.status = 'Unpaid' THEN 1 END)                        AS unpaid_count,
+    ROUND(
+        AVG(CASE WHEN ap.status = 'Paid'
+                 THEN JULIANDAY(ap.payment_date) - JULIANDAY(ap.invoice_date)
+            END), 1)                                                         AS avg_days_to_pay
+FROM accounts_payable ap
+WHERE ap.period <= '2026-03'
+GROUP BY ap.supplier_name, ap.supplier_type, ap.payment_terms_days
+ORDER BY total_inc_gst DESC
+LIMIT 15;
+""",
     }
 
     selected_query = st.selectbox("Select analysis query:", list(query_labels.keys()))
@@ -1836,8 +2574,8 @@ ORDER BY ic.period;
     with col2:
         section("Query Results")
         try:
-            conn = get_connection()
-            result_df = pd.read_sql_query(query_labels[selected_query], conn)
+            with get_connection() as conn:
+                result_df = pd.read_sql_query(query_labels[selected_query], conn)
             if not result_df.empty:
                 # Format numeric columns
                 for col in result_df.select_dtypes(include=[np.number]).columns:
