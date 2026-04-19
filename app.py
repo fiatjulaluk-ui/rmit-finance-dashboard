@@ -587,11 +587,11 @@ if page == "Executive Overview":
     _c_lbl = "All Cost Centres" if len(selected_cc_names) == len(_cc_names_all) else f"{len(selected_cc_names)} of {len(_cc_names_all)} cost centres"
     st.markdown(
         f'<div style="background:#F5F5F5;border-radius:10px;padding:0.65rem 1.2rem;'
-        f'margin-bottom:1rem;border:1px solid #ddd;display:flex;align-items:center;gap:0.6rem">'
+        f'margin-bottom:1rem;border:1px solid #ddd">'
         f'<span style="background:{_badge_clr_eo};color:white;padding:3px 10px;border-radius:12px;'
         f'font-size:0.78rem;font-weight:700">{view_type}</span>'
-        f'<span style="font-size:0.83rem;color:#444">{period_label} &nbsp;·&nbsp; as at <b>{REPORT_DATE_DYN}</b></span>'
-        f'<span style="margin-left:auto;font-size:0.75rem;color:#777">🌏 {_r_lbl} &nbsp;·&nbsp; {_c_lbl}</span>'
+        f'&nbsp; <span style="font-size:0.83rem;color:#444">{period_label} &nbsp;·&nbsp; as at <b>{REPORT_DATE_DYN}</b></span>'
+        f'&nbsp;&nbsp;<span style="font-size:0.75rem;color:#888">| 🌏 {_r_lbl} &nbsp;·&nbsp; {_c_lbl}</span>'
         f'</div>',
         unsafe_allow_html=True
     )
