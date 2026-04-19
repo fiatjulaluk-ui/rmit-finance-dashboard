@@ -66,8 +66,9 @@ st.markdown("""
     }
     [data-testid="stSidebar"] .stRadio > label,
     [data-testid="stSidebar"] p,
-    [data-testid="stSidebar"] span,
-    [data-testid="stSidebar"] div { color: #FFFFFF !important; }
+    [data-testid="stSidebar"] > div > div > div > p,
+    [data-testid="stSidebar"] span { color: #FFFFFF !important; }
+    [data-testid="stSidebar"] label { color: #DDDDDD !important; }
     [data-testid="stSidebar"] hr { border-color: #444; }
 
     /* ── Page header ── */
