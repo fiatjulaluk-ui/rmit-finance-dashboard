@@ -598,7 +598,7 @@ if page == "Executive Overview":
         unsafe_allow_html=True
     )
 
-    st.markdown("<br>", unsafe_allow_html=True)
+
 
     gl  = query("SELECT * FROM general_ledger")
     coa = query("SELECT account_code, account_name FROM chart_of_accounts")
@@ -671,7 +671,7 @@ if page == "Executive Overview":
             mom_type,
         ), unsafe_allow_html=True)
     with c2:
-        exp_mom_arrow = "▼" if exp_mom >= 0 else "▲"   # rising expenses = bad
+        exp_mom_arrow = "▲" if exp_mom >= 0 else "▼"   # rising expenses = bad → ▲ means went up
         st.markdown(kpi_card(
             f"{_kpi_lbl} Expenses",
             fmt_aud(exp_ytd),
@@ -770,7 +770,7 @@ if page == "Executive Overview":
     with col_right:
         # Revenue Mix filtered by selected regions via AR customer mapping
         region_label = f"Region: {', '.join(selected_regions)}" if len(selected_regions) < 2 else "All Regions"
-        section(f"Revenue Mix – YTD  ({region_label})")
+        section(f"Revenue Mix – {period_label}  ({region_label})")
 
         # Map region to AR accounts: Domestic = 4001, International = 4002
         region_acct_map = {"Domestic": "4001", "International": "4002"}
@@ -815,7 +815,8 @@ if page == "Executive Overview":
         st.plotly_chart(fig3, use_container_width=True)
 
     with col4:
-        section(f"Cumulative Net Surplus – YTD to {selected_period}")
+        surplus_deficit = "Surplus" if net_ytd >= 0 else "Deficit"
+        section(f"Cumulative Net {surplus_deficit} – {period_label}")
         monthly_sorted = monthly.sort_values("period")
         monthly_sorted["Cumulative Net"] = monthly_sorted["NPAT"].cumsum()
         fig4 = px.area(monthly_sorted, x="period", y="Cumulative Net",
