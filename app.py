@@ -3658,7 +3658,8 @@ LIMIT 15;
                 _count_kw = {"count", "years", "life", "terms", "invoice_count",
                              "open_inv", "paid_count", "unpaid_count", "sequence",
                              "target_day", "is_", "line_no"}
-                _days_kw  = {"days", "dpo", "weighted_dpo", "avg_days"}
+                _days_kw  = {"dpo", "weighted_dpo", "avg_days", "days_to_pay",
+                             "days_past", "age_days"}
                 for col in result_df.select_dtypes(include=[np.number]).columns:
                     col_l = col.lower()
                     if any(kw in col_l for kw in _pct_kw):
