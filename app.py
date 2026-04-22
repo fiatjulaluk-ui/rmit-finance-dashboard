@@ -3655,17 +3655,21 @@ LIMIT 15;
                 result_df = pd.read_sql_query(active_sql, conn)
             if not result_df.empty:
                 _pct_kw   = {"pct", "margin", "ratio", "rate"}
-                _count_kw = {"count", "days", "years", "life", "terms", "invoice_count",
-                             "open_inv", "paid_count", "unpaid_count", "dpo", "weighted_dpo",
-                             "avg_days", "sequence", "target_day", "is_", "line_no"}
+                _count_kw = {"count", "years", "life", "terms", "invoice_count",
+                             "open_inv", "paid_count", "unpaid_count", "sequence",
+                             "target_day", "is_", "line_no"}
+                _days_kw  = {"days", "dpo", "weighted_dpo", "avg_days"}
                 for col in result_df.select_dtypes(include=[np.number]).columns:
                     col_l = col.lower()
                     if any(kw in col_l for kw in _pct_kw):
                         result_df[col] = result_df[col].apply(
                             lambda x: f"{x:.2f}%" if pd.notna(x) else "–")
+                    elif any(kw in col_l for kw in _days_kw):
+                        result_df[col] = result_df[col].apply(
+                            lambda x: f"{x:.1f} days" if pd.notna(x) else "–")
                     elif any(kw in col_l for kw in _count_kw):
                         result_df[col] = result_df[col].apply(
-                            lambda x: f"{x:,.1f}" if pd.notna(x) else "–")
+                            lambda x: f"{int(x):,}" if pd.notna(x) else "–")
                     else:
                         # Default: treat as dollar amount
                         result_df[col] = result_df[col].apply(
