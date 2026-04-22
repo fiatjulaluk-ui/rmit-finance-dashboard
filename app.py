@@ -193,6 +193,21 @@ def fmt_pct(val):
     return f"{val:.1f}%" if not pd.isna(val) else "–"
 
 
+def right_align_df(df):
+    """Return column_config dict that right-aligns all string columns containing
+    formatted numbers ($ amounts, percentages). Streamlit right-aligns numeric
+    columns by default but left-aligns strings — this restores accounting convention."""
+    cfg = {}
+    for col in df.columns:
+        sample = df[col].dropna().head(5)
+        if sample.empty:
+            continue
+        first = str(sample.iloc[0])
+        if first.startswith("$") or first.startswith("(") or first.endswith("%"):
+            cfg[col] = st.column_config.TextColumn(col, width="small")
+    return cfg
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SIDEBAR
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1569,6 +1584,7 @@ elif page == "Accounts Receivable":
             aging_disp,
             use_container_width=True,
             hide_index=True,
+            column_config=right_align_df(aging_disp),
         )
 
     with col_side:
@@ -1685,7 +1701,8 @@ elif page == "Accounts Receivable":
             )
             top_debtors.columns = ["Customer", "outstanding"]
             top_debtors["outstanding"] = top_debtors["outstanding"].apply(fmt_table)
-            st.dataframe(top_debtors, use_container_width=True, hide_index=True)
+            st.dataframe(top_debtors, use_container_width=True, hide_index=True,
+                         column_config=right_align_df(top_debtors))
 
     # ── Progressive disclosure: Open Invoice Detail ───────────────────────────
     with st.expander("Open Invoice Detail — Domestic & International", expanded=False):
@@ -1712,7 +1729,8 @@ elif page == "Accounts Receivable":
                 _ar_disp["due_date"]      = pd.to_datetime(_ar_disp["due_date"]).dt.strftime("%d/%m/%Y")
                 _ar_disp["total_inc_gst"] = _ar_disp["total_inc_gst"].apply(fmt_table)
                 _ar_disp.columns = ["Invoice #","Customer","Invoice Date","Due Date","Amount (incl. GST)","Aging","Status"]
-                st.dataframe(_ar_disp, use_container_width=True, hide_index=True)
+                st.dataframe(_ar_disp, use_container_width=True, hide_index=True,
+                             column_config=right_align_df(_ar_disp))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1968,7 +1986,8 @@ Weighting by invoice value ensures large invoices influence the result proportio
             "Invoice Date", "Due Date", "Terms (Days)",
             "Amount ex GST", "GST", "Total inc GST", "Status"
         ]
-        st.dataframe(display_upcoming, use_container_width=True, hide_index=True)
+        st.dataframe(display_upcoming, use_container_width=True, hide_index=True,
+                     column_config=right_align_df(display_upcoming))
         st.caption(f"Total due in next 30 days: **{fmt_table(upcoming['total_inc_gst'].sum())}**")
 
     # ── Detailed AP Invoice List ──────────────────────────────────────────
@@ -1988,7 +2007,8 @@ Weighting by invoice value ensures large invoices influence the result proportio
         "Invoice Date", "Due Date", "Terms (Days)",
         "Amount ex GST", "GST", "Total inc GST", "Status"
     ]
-    st.dataframe(display_ap, use_container_width=True, hide_index=True)
+    st.dataframe(display_ap, use_container_width=True, hide_index=True,
+                 column_config=right_align_df(display_ap))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3651,7 +3671,8 @@ LIMIT 15;
                     else:
                         result_df[col] = result_df[col].apply(
                             lambda x: f"{x:,.0f}" if pd.notna(x) else "–")
-                st.dataframe(result_df, use_container_width=True, hide_index=True)
+                st.dataframe(result_df, use_container_width=True, hide_index=True,
+                             column_config=right_align_df(result_df))
                 st.caption(f"{len(result_df)} rows returned")
             else:
                 st.info("No results returned.")
