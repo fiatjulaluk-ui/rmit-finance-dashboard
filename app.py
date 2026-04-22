@@ -1739,7 +1739,7 @@ elif page == "Accounts Payable":
     ap_all["due_date"]     = pd.to_datetime(ap_all["due_date"])
     ap_all["payment_date"] = pd.to_datetime(ap_all["payment_date"], errors="coerce")
 
-    ref_date = pd.Timestamp(f"{selected_period}-01") + pd.offsets.MonthEnd(0)
+    ref_date = pd.Timestamp("2026-03-31")
 
     # Filter to selected period window (by invoice_date period)
     ap_win = ap_all[
@@ -1841,9 +1841,8 @@ elif page == "Accounts Payable":
             title="Outstanding AP by Supplier Type",
             hole=0.4,
         )
-        fig_type.update_traces(textposition="outside", textinfo="percent+label", textfont_size=10)
-        fig_type.update_layout(showlegend=False, title_font_size=14,
-                               height=320, margin=dict(l=10, r=10, t=40, b=40))
+        fig_type.update_traces(textposition="inside", textinfo="percent+label")
+        fig_type.update_layout(showlegend=False, title_font_size=14)
         st.plotly_chart(fig_type, use_container_width=True)
 
     # ── DPO Trend vs Target ────────────────────────────────────────────────
@@ -2062,7 +2061,7 @@ elif page == "Bank Reconciliation":
         </table>""", unsafe_allow_html=True)
 
     with col2:
-        section("Daily Cash Balance – March 2026")
+        section(f"Daily Cash Balance – {period_label}")
         march_sorted = march.sort_values("transaction_date")
         fig = px.line(march_sorted, x="transaction_date", y="balance",
                       color_discrete_sequence=[RMIT_RED])
@@ -2073,8 +2072,9 @@ elif page == "Bank Reconciliation":
                           margin=dict(l=10,r=10,t=20,b=30))
         st.plotly_chart(fig, use_container_width=True)
 
-        section("Transaction Volume by Type – YTD")
-        by_type = bank.groupby("transaction_type").agg(
+        section(f"Transaction Volume by Type – {period_label}")
+        bank_period = bank[bank["period"].between(period_start, period_end)]
+        by_type = bank_period.groupby("transaction_type").agg(
             Count=("transaction_id","count"),
             Total_Debit=("debit","sum"),
             Total_Credit=("credit","sum")
