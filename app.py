@@ -784,11 +784,13 @@ if page == "Executive Overview":
             .reset_index()
         )
         rev_by_acct = rev_by_acct.merge(coa, on="account_code")
-        rev_by_acct["account_name"] = rev_by_acct["account_name"].str.replace("Course Fees – ", "")
+        rev_by_acct["account_name"] = (rev_by_acct["account_name"]
+    .str.replace("Course Fees – ", "")
+    .str.replace("Consulting & Advisory Revenue", "Consulting & Advisory"))
         fig2 = px.pie(rev_by_acct, values="credit", names="account_name",
                       color_discrete_sequence=CHART_PALETTE, hole=0.45)
-        fig2.update_traces(textposition="outside", textinfo="percent+label",
-                           textfont_size=11)
+        fig2.update_traces(textposition="auto", textinfo="percent+label",
+                   textfont_size=10, pull=[0, 0, 0.1, 0.1])
         fig2.update_layout(
             height=360, margin=dict(l=10, r=10, t=20, b=10),
             showlegend=False, paper_bgcolor="white"
