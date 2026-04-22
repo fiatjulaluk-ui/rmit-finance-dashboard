@@ -1478,7 +1478,7 @@ elif page == "Accounts Receivable":
     open_ar_all["due_date"]     = pd.to_datetime(open_ar_all["due_date"])
     # Ref date driven by selected period
     ref_date = pd.Timestamp(f"{selected_period}-01") + pd.offsets.MonthEnd(0)
-    open_ar_all["age_days"] = (ref_date - open_ar_all["invoice_date"]).dt.days
+    open_ar_all["age_days"] = (ref_date - open_ar_all["due_date"]).dt.days
 
     # Apply region filter
     open_ar = open_ar_all[open_ar_all["region"].isin(selected_regions)].copy()
@@ -1573,13 +1573,13 @@ elif page == "Accounts Receivable":
 
     with col_side:
         section("Outstanding by Status")
-        _status_map  = {"Current (0–30)":"On Time","31–60 Days":"Overdue","61–90 Days":"Overdue","90+ Days":"Bad Debt Risk"}
-        _status_clrs = {"On Time": GREEN, "Overdue": ORANGE, "Bad Debt Risk": RMIT_RED}
+        _status_map  = {"Current (0–30)":"On Time","31–60 Days":"Overdue","61–90 Days":"Overdue","90+ Days":"90+ Days Overdue"}
+        _status_clrs = {"On Time": GREEN, "Overdue": ORANGE, "90+ Days Overdue": RMIT_RED}
         _sgrp = (
             aging_summary.assign(grp=aging_summary["bucket"].map(_status_map))
             .groupby("grp")["amount"].sum().reset_index()
         )
-        _sgrp["grp"] = pd.Categorical(_sgrp["grp"], ["On Time","Overdue","Bad Debt Risk"], ordered=True)
+        _sgrp["grp"] = pd.Categorical(_sgrp["grp"], ["On Time","Overdue","90+ Days Overdue"], ordered=True)
         _sgrp = _sgrp.sort_values("grp")
 
         fig_donut = go.Figure(go.Pie(
