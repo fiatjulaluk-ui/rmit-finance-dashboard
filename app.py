@@ -962,8 +962,12 @@ elif page == "Month-End Close":
     st.markdown("<br>", unsafe_allow_html=True)
     section("Historical Close Performance (Days to Close)")
 
+    # Only include periods where ALL tasks are complete
+    period_task_counts = checklist.groupby("period")["status"].count()
+    period_done_counts = checklist[checklist["status"] == "Complete"].groupby("period")["status"].count()
+    fully_closed_periods = period_task_counts[period_task_counts == period_done_counts].index.tolist()
     close_perf = (
-        checklist[checklist["status"] == "Complete"]
+        checklist[checklist["period"].isin(fully_closed_periods)]
         .groupby("period")["completed_date"]
         .max()
         .reset_index()
