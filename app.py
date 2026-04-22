@@ -919,7 +919,8 @@ elif page == "Month-End Close":
         </tr>"""
 
         for _, row in day_tasks.iterrows():
-            completed = row["completed_date"] if row["completed_date"] and row["completed_date"] != "None" else "–"
+            _cd = row["completed_date"]
+            completed = "–" if (not _cd or _cd == "None" or (isinstance(_cd, float) and pd.isna(_cd))) else _cd
             dep_seq   = row.get("depends_on_seq")
             dep_note  = f"← task {int(dep_seq)}" if pd.notna(dep_seq) and dep_seq else "–"
             blocked   = bool(row["blocked"])
@@ -929,7 +930,7 @@ elif page == "Month-End Close":
                 <td style="text-align:center;color:#888;font-size:0.8rem;padding:7px 8px">{int(row['task_sequence'])}</td>
                 <td style="font-size:0.84rem;padding:7px 8px">{row['task_name']}</td>
                 <td style="font-size:0.78rem;color:#888;padding:7px 8px;font-style:italic;text-align:center">{dep_note}</td>
-                <td style="font-size:0.81rem;color:#555;padding:7px 8px">{row['owner']}</td>
+                <td style="font-size:0.81rem;color:#555;padding:7px 8px">{str(row['owner']).replace('_', ' ')}</td>
                 <td style="padding:7px 8px">{badge(row['status'], blocked)}</td>
                 <td style="font-size:0.81rem;color:#555;padding:7px 8px">{completed}</td>
             </tr>"""
@@ -962,7 +963,7 @@ elif page == "Month-End Close":
     section("Historical Close Performance (Days to Close)")
 
     close_perf = (
-        closed[closed["status"] == "Complete"]
+        checklist[checklist["status"] == "Complete"]
         .groupby("period")["completed_date"]
         .max()
         .reset_index()
