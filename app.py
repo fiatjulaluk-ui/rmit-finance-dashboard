@@ -3638,7 +3638,7 @@ LIMIT 15;
                 _dollar_kw = {"amount","balance","wages","tax","revenue","expense","net",
                               "cost","dep","variance","gst","itc","outstanding","charge",
                               "current","days_31","days_61","over_90","current_0","payable",
-                              "collected","spend","total","ic_"}
+                              "collected","spend","total","ic_","threshold","gross"}
                 _col_cfg = {}
                 for col in result_df.select_dtypes(include=[np.number]).columns:
                     col_l = col.lower()
@@ -3647,7 +3647,7 @@ LIMIT 15;
                             lambda x: f"{x:.2f}%" if pd.notna(x) else "–")
                     elif any(kw in col_l for kw in _dollar_kw):
                         result_df[col] = result_df[col].apply(
-                            lambda x: (f"(${abs(x):,.0f})" if x < 0 else f"${x:,.0f}") if pd.notna(x) else "–")
+                            lambda x: (f"(${abs(x):,.0f})" if x < 0 and abs(x) >= 0.5 else f"${x:,.0f}") if pd.notna(x) else "–")
                     else:
                         result_df[col] = result_df[col].apply(
                             lambda x: f"{x:,.0f}" if pd.notna(x) else "–")
