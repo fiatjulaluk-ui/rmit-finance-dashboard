@@ -474,7 +474,7 @@ with st.sidebar:
         f'<div style="font-size:0.68rem;color:#888;margin-top:0.3rem;line-height:1.6">'
         f'<b style="color:#ccc">FBT Rate:</b> {indiv_top_rate*100:.1f}% + {medicare_levy*100:.1f}% = '
         f'<b style="color:#E8192C">{fbt_rate*100:.1f}%</b><br>'
-        f'<b style="color:#ccc">T1</b> (1+GST)/(1-FBT) = {fbt_type1:.4f} &nbsp;'
+        f'<b style="color:#ccc">T1</b> ATO statutory = {fbt_type1:.4f} [formula (1+GST)/(1−FBT)] &nbsp;'
         f'<b style="color:#ccc">T2</b> 1/(1-FBT) = {fbt_type2:.4f}'
         f'</div>',
         unsafe_allow_html=True

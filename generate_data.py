@@ -49,7 +49,7 @@ TAX_CONFIG = {
     # ── EV Home Charging Rate — PCG 2024/2 ──────────────────────────────────
     # ATO-published rate for calculating the electricity cost component of running
     # a zero-emission vehicle under the Operating Cost Method (alternative to stat formula).
-    # Updated annually; FY2027: 5.47c/km — confirmed per PCG 2024/2 update.
+    # Updated annually; FY2027: 5.47c/km — projected/draft; update when ATO confirms.
     "EV_HOME_CHARGING_C_PER_KM":     4.20,               # cents/km — PCG 2024/2, FY2026
     # ── LCT Thresholds — indexed annually (1 July each year) ────────────────
     # FY2027 projections: ICE ~$82,000+, FEV ~$92,000–$95,000 (CPI March quarter).
